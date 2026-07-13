@@ -1,0 +1,17 @@
+{
+  "name": "basis-trading-backtest",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/tui.ts",
+    "tui": "bun run src/tui.ts",
+    "backtest": "bun run src/index.ts",
+    "optimize": "bun run src/index.ts --optimize",
+    "markets": "bun run src/index.ts --markets",
+    "list": "bun run src/index.ts --list"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  }
+}

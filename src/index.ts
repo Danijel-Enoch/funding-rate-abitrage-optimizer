@@ -1,0 +1,374 @@
+/**
+ * Basis Trading Backtest - CLI Mode
+ *
+ * Usage:
+ *   bun run src/index.ts [coin] [days] [capital]
+ *   bun run src/index.ts --optimize ETH [days] [capital]
+ *   bun run src/index.ts --markets
+ *   bun run src/index.ts --all [days] [capital]
+ *   bun run src/index.ts --category L1 [days] [capital]
+ *   bun run src/index.ts --list
+ *   bun run src/index.ts --venue hyperliquid lighter ETH 30 50000
+ */
+
+import { HyperliquidExchange } from "./exchanges/hyperliquid";
+import { BinanceSpotExchange } from "./exchanges/binance";
+import { runBacktest, type BacktestConfig } from "./backtest";
+import { MARKETS, getCategories, getMarketsByCategory, type MarketConfig } from "./markets";
+import { optimizeCoin } from "./optimize";
+
+const hl = new HyperliquidExchange();
+const binance = new BinanceSpotExchange();
+
+const args = process.argv.slice(2);
+let MODE = "ETH";
+let DAYS = 30;
+let INITIAL_CAPITAL = 50000;
+let VENUE_A = "hyperliquid";
+let VENUE_B = "binance";
+
+if (args[0] === "--list") {
+  MODE = "--list";
+} else if (args[0] === "--markets") {
+  MODE = "--markets";
+} else if (args[0] === "--optimize") {
+  MODE = "--optimize";
+  VENUE_A = args[1] || "ETH";
+  DAYS = parseInt(args[2] || "30");
+  INITIAL_CAPITAL = parseFloat(args[3] || "50000");
+} else if (args[0] === "--all") {
+  MODE = "--all";
+  DAYS = parseInt(args[1] || "30");
+  INITIAL_CAPITAL = parseFloat(args[2] || "50000");
+} else if (args[0] === "--category") {
+  MODE = "--category";
+  DAYS = parseInt(args[2] || "30");
+  INITIAL_CAPITAL = parseFloat(args[3] || "50000");
+} else if (args[0] === "--venue") {
+  MODE = "--venue";
+  VENUE_A = args[1] || "hyperliquid";
+  VENUE_B = args[2] || "binance";
+  VENUE_A = args[3] || "ETH";
+  DAYS = parseInt(args[4] || "30");
+  INITIAL_CAPITAL = parseFloat(args[5] || "50000");
+} else {
+  MODE = args[0] || "ETH";
+  DAYS = parseInt(args[1] || "30");
+  INITIAL_CAPITAL = parseFloat(args[2] || "50000");
+}
+
+async function runSingleBacktest(market: MarketConfig, days: number, capital: number) {
+  const endTime = Date.now();
+  const startTime = endTime - days * 24 * 60 * 60 * 1000;
+
+  try {
+    const ratesA = await hl.fetchFundingRates(market.hlCoin, startTime, endTime);
+    const prices = await binance.fetchPrices(market.binanceSymbol, startTime, endTime);
+
+    if (ratesA.length === 0 || prices.length === 0) return null;
+
+    // Create synthetic spot funding (0 for all)
+    const ratesB = ratesA.map((r) => ({ ...r, fundingRate: 0, coin: "spot" }));
+
+    const config: Partial<BacktestConfig> = {
+      initialCapital: capital,
+      strategy: "spot_vs_perp",
+      fundingThreshold: 0.00001,
+      maxSpreadBps: 50,
+      maxPositionSize: capital * 0.5,
+      venueA: "binance",
+      venueB: "hyperliquid",
+    };
+
+    const result = runBacktest(ratesA, ratesB, config);
+    return { market, result };
+  } catch {
+    return null;
+  }
+}
+
+function printResult(market: MarketConfig, result: any, capital: number) {
+  const ret = ((result.totalPnl / capital) * 100).toFixed(2);
+  const ann = (result.annualizedReturn * 100).toFixed(1);
+  const wr = (result.winRate * 100).toFixed(0);
+  const dd = (result.maxDrawdown * 100).toFixed(1);
+  const sr = result.sharpeRatio.toFixed(1);
+  const trades = result.totalTrades;
+  const pnl = result.totalPnl.toFixed(0);
+
+  console.log(
+    `  ${market.hlCoin.padEnd(8)}` +
+    `${market.name.padEnd(25)}` +
+    `${String(trades).padStart(5)}` +
+    `${(wr + "%").padStart(6)}` +
+    `$${pnl.padStart(8)}` +
+    `${(ret + "%").padStart(8)}` +
+    `${(ann + "%").padStart(8)}` +
+    `${(dd + "%").padStart(7)}` +
+    `${sr.padStart(7)}`
+  );
+}
+
+async function main() {
+  if (MODE === "--list") {
+    console.log("\nAvailable Markets:\n");
+    const categories = getCategories();
+    for (const cat of categories) {
+      const markets = getMarketsByCategory(cat);
+      console.log(`  ${cat} (${markets.length}):`);
+      for (const m of markets) console.log(`    ${m.hlCoin.padEnd(10)} ${m.name}`);
+      console.log();
+    }
+    console.log(`Total: ${MARKETS.length} markets`);
+    return;
+  }
+
+  if (MODE === "--markets") {
+    const ex = await import("./exchanges/index");
+
+    console.log("=".repeat(100));
+    console.log("  MARKET AVAILABILITY ACROSS EXCHANGES");
+    console.log("=".repeat(100));
+    console.log();
+    console.log("  Fetching available coins from each exchange...\n");
+
+    const [hlCoins, ligCoins, astCoins, extCoins, binCoins] = await Promise.all([
+      ex.hyperliquid.getAvailableCoins().catch(() => [] as string[]),
+      ex.lighter.getAvailableCoins().catch(() => [] as string[]),
+      ex.aster.getAvailableCoins().catch(() => [] as string[]),
+      ex.extended.getAvailableCoins().catch(() => [] as string[]),
+      ex.binanceSpot.getAvailableSymbols().catch(() => [] as string[]),
+    ]);
+
+    // Normalize: strip USDT suffix from Binance, /USDC from Lighter
+    const normalize = (s: string) => s.replace(/USDT$/, "").replace(/\/USDC$/, "").toUpperCase();
+
+    const hlSet = new Set(hlCoins.map(normalize));
+    const ligSet = new Set(ligCoins.map(normalize));
+    const astSet = new Set(astCoins.map(normalize));
+    const extSet = new Set(extCoins.map(normalize));
+    const binSet = new Set(binCoins.map(normalize));
+
+    // All unique coins
+    const allCoins = new Set([...hlSet, ...ligSet, ...astSet, ...extSet, ...binSet]);
+
+    console.log(`  Hyperliquid: ${hlSet.size} | Lighter: ${ligSet.size} | Aster: ${astSet.size} | Extended: ${extSet.size} | Binance: ${binSet.size}`);
+    console.log();
+
+    // Count how many exchanges each coin is on
+    const coinVenueCount: Array<{ coin: string; venues: string[]; count: number }> = [];
+    for (const coin of allCoins) {
+      const venues: string[] = [];
+      if (hlSet.has(coin)) venues.push("HL");
+      if (ligSet.has(coin)) venues.push("LIG");
+      if (astSet.has(coin)) venues.push("AST");
+      if (extSet.has(coin)) venues.push("EXT");
+      if (binSet.has(coin)) venues.push("BIN");
+      coinVenueCount.push({ coin, venues, count: venues.length });
+    }
+
+    // Sort by venue count descending, then alphabetically
+    coinVenueCount.sort((a, b) => b.count - a.count || a.coin.localeCompare(b.coin));
+
+    // Show coins available on all 5 exchanges
+    const all5 = coinVenueCount.filter((c) => c.count === 5);
+    const any4 = coinVenueCount.filter((c) => c.count === 4);
+    const any3 = coinVenueCount.filter((c) => c.count === 3);
+    const any2 = coinVenueCount.filter((c) => c.count === 2);
+
+    console.log("=".repeat(100));
+    console.log(`  ALL 5 EXCHANGES (${all5.length} coins)`);
+    console.log("-".repeat(100));
+    for (const c of all5) {
+      console.log(`    ${c.coin.padEnd(12)} ${c.venues.join(", ")}`);
+    }
+
+    console.log();
+    console.log("=".repeat(100));
+    console.log(`  4 EXCHANGES (${any4.length} coins)`);
+    console.log("-".repeat(100));
+    for (const c of any4) {
+      console.log(`    ${c.coin.padEnd(12)} ${c.venues.join(", ")}`);
+    }
+
+    console.log();
+    console.log("=".repeat(100));
+    console.log(`  3 EXCHANGES (${any3.length} coins)`);
+    console.log("-".repeat(100));
+    for (const c of any3) {
+      console.log(`    ${c.coin.padEnd(12)} ${c.venues.join(", ")}`);
+    }
+
+    console.log();
+    console.log("=".repeat(100));
+    console.log(`  2 EXCHANGES (${any2.length} coins)`);
+    console.log("-".repeat(100));
+    for (const c of any2) {
+      console.log(`    ${c.coin.padEnd(12)} ${c.venues.join(", ")}`);
+    }
+
+    console.log();
+    console.log("=".repeat(100));
+    console.log(`  SUMMARY: ${all5.length} on all 5 | ${any4.length} on 4 | ${any3.length} on 3 | ${any2.length} on 2 | ${coinVenueCount.filter(c => c.count === 1).length} on 1`);
+    console.log("=".repeat(100));
+    return;
+  }
+
+  if (MODE === "--optimize") {
+    const coin = VENUE_A.toUpperCase();
+    console.log("=".repeat(90));
+    console.log("  BACKTEST OPTIMIZATION");
+    console.log("  Tests all strategy/venue combos, ranks by PnL with minimal drawdown");
+    console.log("  Includes taker/maker fees and bid-ask spread costs");
+    console.log("  Perp vs Perp: 3x leverage on both sides");
+    console.log("=".repeat(90));
+    console.log();
+    console.log(`  Coin:    ${coin}`);
+    console.log(`  Period:  ${DAYS} days`);
+    console.log(`  Capital: $${INITIAL_CAPITAL.toLocaleString()}`);
+    console.log();
+    console.log("  Fetching data...\n");
+
+    const results = await optimizeCoin(coin, DAYS, INITIAL_CAPITAL, (cur, total, combo) => {
+      process.stdout.write(`\r  [${cur}/${total}] ${combo.label.padEnd(40)}`);
+    });
+
+    process.stdout.write("\r" + " ".repeat(60) + "\r");
+
+    if (results.length === 0) {
+      console.log("  No data available. Try a different coin or period.");
+      return;
+    }
+
+    console.log();
+    console.log("=".repeat(90));
+    console.log(
+      "  " +
+      "#".padStart(3) +
+      "  " +
+      "Strategy".padEnd(14) +
+      "Venue Pair".padEnd(28) +
+      "Net PnL".padStart(10) +
+      "Fees".padStart(8) +
+      "Trades".padStart(7) +
+      "Win%".padStart(6) +
+      "MDD%".padStart(7) +
+      "Score".padStart(8)
+    );
+    console.log("-".repeat(90));
+
+    for (let i = 0; i < Math.min(results.length, 15); i++) {
+      const r = results[i];
+      const strat = r.combo.strategy === "spot_vs_perp" ? "Spot/Perp" : "Perp/Perp";
+      const pair = r.combo.label.padEnd(28);
+      const pnl = `$${r.netPnl.toFixed(0)}`.padStart(10);
+      const fees = `$${r.totalFees.toFixed(0)}`.padStart(8);
+      const trades = `${r.result.totalTrades}`.padStart(7);
+      const win = `${(r.result.winRate * 100).toFixed(0)}%`.padStart(6);
+      const dd = `${r.maxDrawdownPct.toFixed(1)}%`.padStart(7);
+      const score = `${r.score.toFixed(0)}`.padStart(8);
+
+      const medal = i === 0 ? " <- BEST" : "";
+      console.log(`  ${(i + 1 + ".").padStart(4)} ${strat.padEnd(14)}${pair}${pnl}${fees}${trades}${win}${dd}${score}${medal}`);
+    }
+
+    console.log("-".repeat(90));
+
+    const best = results[0];
+    console.log();
+    console.log(`  BEST: ${best.combo.label}`);
+    console.log(`  Strategy:    ${best.combo.strategy === "spot_vs_perp" ? "Spot vs Perp (2x perp)" : "Perp vs Perp (3x both)"}`);
+    console.log(`  Net PnL:     $${best.netPnl.toFixed(2)}`);
+    console.log(`  Total Fees:  $${best.totalFees.toFixed(2)}`);
+    console.log(`  Funding:     $${(best.result.totalFundingCollected - best.result.totalFundingPaid).toFixed(2)}`);
+    console.log(`  Trades:      ${best.result.totalTrades}`);
+    console.log(`  Win Rate:    ${(best.result.winRate * 100).toFixed(1)}%`);
+    console.log(`  Max DD:      ${best.maxDrawdownPct.toFixed(2)}%`);
+    console.log(`  Score:       ${best.score.toFixed(2)}`);
+    console.log();
+    console.log("=".repeat(90));
+    return;
+  }
+
+  console.log("=".repeat(110));
+  console.log("  DELTA-NEUTRAL BASIS TRADING BACKTEST");
+  console.log("  Hyperliquid vs Binance Spot");
+  console.log("=".repeat(110));
+  console.log();
+
+  let marketsToRun: MarketConfig[] = [];
+
+  if (MODE === "--all") {
+    marketsToRun = MARKETS;
+  } else if (MODE === "--category") {
+    const category = args[1];
+    marketsToRun = getMarketsByCategory(category);
+    if (marketsToRun.length === 0) {
+      console.error(`Category "${category}" not found.`);
+      process.exit(1);
+    }
+  } else {
+    const market = MARKETS.find((m) => m.hlCoin === MODE.toUpperCase());
+    if (!market) {
+      console.error(`Coin "${MODE}" not found. Use --list.`);
+      process.exit(1);
+    }
+    marketsToRun = [market];
+  }
+
+  console.log(`Period:            ${DAYS} days`);
+  console.log(`Initial Capital:   $${INITIAL_CAPITAL.toLocaleString()}`);
+  console.log(`Markets:           ${marketsToRun.length}`);
+  console.log();
+
+  console.log("=".repeat(110));
+  console.log(
+    "  " +
+    "Coin".padEnd(8) +
+    "Name".padEnd(25) +
+    "Trades".padStart(6) +
+    "Win%".padStart(6) +
+    "PnL".padStart(9) +
+    "Return".padStart(8) +
+    "Ann.%".padStart(8) +
+    "MDD".padStart(7) +
+    "Sharpe".padStart(7)
+  );
+  console.log("-".repeat(110));
+
+  const results: Array<{ market: MarketConfig; result: any }> = [];
+
+  for (let i = 0; i < marketsToRun.length; i++) {
+    const market = marketsToRun[i];
+    process.stdout.write(`\r  Processing ${market.hlCoin} (${i + 1}/${marketsToRun.length})...`);
+    const res = await runSingleBacktest(market, DAYS, INITIAL_CAPITAL);
+    if (res) results.push(res);
+  }
+
+  process.stdout.write("\r" + " ".repeat(60) + "\r");
+
+  results.sort((a, b) => b.result.annualizedReturn - a.result.annualizedReturn);
+
+  for (const { market, result } of results) {
+    printResult(market, result, INITIAL_CAPITAL);
+  }
+
+  console.log("-".repeat(110));
+
+  if (results.length > 0) {
+    const totalPnl = results.reduce((s, r) => s + r.result.totalPnl, 0);
+    const avgReturn = results.reduce((s, r) => s + r.result.annualizedReturn, 0) / results.length;
+    const profitable = results.filter((r) => r.result.totalPnl > 0).length;
+
+    console.log();
+    console.log(`  Markets tested: ${results.length}/${marketsToRun.length}`);
+    console.log(`  Profitable:     ${profitable}/${results.length}`);
+    console.log(`  Total PnL:      $${totalPnl.toFixed(2)}`);
+    console.log(`  Avg Ann. Return: ${(avgReturn * 100).toFixed(1)}%`);
+  }
+
+  console.log();
+  console.log("=".repeat(110));
+}
+
+main().catch(console.error);

@@ -53,6 +53,7 @@ let SPOT_VENUE: "all" | "uniswap" | "pancakeswap" | "bsc-stocks" = "all";
 let EXCLUDE = new Set<string>();
 let TICKERS: string[] = [];
 let DISCOVER_MODE = false;
+let HL_TICKER_MAP = new Map<string, string>(); // manual HL ticker overrides
 
 const consumed = new Set<number>();
 for (let i = 0; i < args.length; i++) {
@@ -69,6 +70,13 @@ for (let i = 0; i < args.length; i++) {
     const val = args[i + 1].toLowerCase();
     if (["uniswap", "pancakeswap", "bsc-stocks", "all"].includes(val)) {
       SPOT_VENUE = val as typeof SPOT_VENUE;
+    }
+    consumed.add(i); consumed.add(i + 1); i++;
+  } else if (args[i] === "--hl-map" && args[i + 1]) {
+    // Manual HL ticker mapping: --hl-map TSLA:TSLAUSD,NVDA:NVDAUSD
+    for (const pair of args[i + 1].split(",")) {
+      const [stock, hl] = pair.split(":");
+      if (stock && hl) HL_TICKER_MAP.set(stock.toUpperCase().trim(), hl.trim());
     }
     consumed.add(i); consumed.add(i + 1); i++;
   } else if (args[i] === "--all") {
@@ -242,6 +250,9 @@ async function main() {
   console.log(`  Capital/position: $${CAPITAL.toLocaleString()}`);
   console.log(`  Period:           ${DAYS} days`);
   console.log(`  Spot venue:       ${SPOT_VENUE}`);
+  if (HL_TICKER_MAP.size > 0) {
+    console.log(`  HL ticker map:    ${Array.from(HL_TICKER_MAP.entries()).map(([k, v]) => `${k}=${v}`).join(", ")}`);
+  }
   if (CATEGORY) console.log(`  Category:         ${CATEGORY}`);
   if (TICKERS.length > 0) console.log(`  Stocks:           ${TICKERS.join(", ")}`);
   if (USE_ALL) console.log(`  Stocks:           ALL available`);
@@ -286,16 +297,77 @@ async function main() {
   }
 
   const hlAvailable = new Set(hlCoins.map((c) => c.toUpperCase()));
-  const availableStocks = stocks.filter((s) => hlAvailable.has(s.hyperliquidTicker));
+
+  // Fuzzy match: Hyperliquid may use variations like TSLAUSD, stock:TSLA, tsla, etc.
+  function findHLTicker(stock: TokenizedStock): string | null {
+    const ticker = stock.hyperliquidTicker.toUpperCase();
+
+    // 0. Manual override from --hl-map flag
+    if (HL_TICKER_MAP.has(stock.ticker)) {
+      const mapped = HL_TICKER_MAP.get(stock.ticker)!;
+      if (hlAvailable.has(mapped.toUpperCase())) return mapped;
+    }
+
+    // 1. Exact match
+    if (hlAvailable.has(ticker)) return ticker;
+
+    // 2. Check with USD suffix (TSLAUSD, TSLA/USD, etc.)
+    for (const suffix of ["USD", "/USD", "-USD"]) {
+      if (hlAvailable.has(ticker + suffix)) return ticker + suffix;
+    }
+
+    // 3. Check with prefix variations (stock:TSLA, xyz:TSLA, etc.)
+    for (const coin of hlCoins) {
+      const upper = coin.toUpperCase();
+      // HIP-3 format: "dex:COIN"
+      if (upper.includes(":")) {
+        const parts = upper.split(":");
+        if (parts[1] === ticker || parts[1].startsWith(ticker)) return coin;
+      }
+    }
+
+    // 4. Fuzzy: any coin that starts with or contains the ticker
+    for (const coin of hlCoins) {
+      const upper = coin.toUpperCase();
+      if (upper === ticker || upper.startsWith(ticker) || upper.endsWith(ticker)) return coin;
+    }
+
+    return null;
+  }
+
+  // Map stocks to their HL tickers
+  const stockToHL = new Map<string, string>();
+  const availableStocks: TokenizedStock[] = [];
+  for (const stock of stocks) {
+    const hlTicker = findHLTicker(stock);
+    if (hlTicker) {
+      stockToHL.set(stock.ticker, hlTicker);
+      availableStocks.push(stock);
+    }
+  }
 
   if (availableStocks.length === 0) {
     console.error("  None of the requested stocks are available on Hyperliquid.");
     console.log(`  Requested: ${stocks.map((s) => s.ticker).join(", ")}`);
     console.log(`  Hyperliquid has ${hlAvailable.size} coins`);
+    // Show some stock-like tickers for debugging
+    const stockLike = hlCoins.filter((c) => {
+      const u = c.toUpperCase();
+      return u.includes("TSLA") || u.includes("NVDA") || u.includes("AAPL") || u.includes("SPY") || u.includes("STOCK") || u.includes("HIP");
+    });
+    if (stockLike.length > 0) {
+      console.log(`  Stock-like tickers found: ${stockLike.join(", ")}`);
+    }
     return;
   }
 
   console.log(`  ${availableStocks.length}/${stocks.length} stocks available on Hyperliquid perps`);
+  for (const stock of availableStocks) {
+    const hlTicker = stockToHL.get(stock.ticker);
+    if (hlTicker !== stock.hyperliquidTicker) {
+      console.log(`    ${stock.ticker} -> HL ticker: ${hlTicker}`);
+    }
+  }
   console.log();
 
   const endTime = Date.now();
@@ -310,11 +382,12 @@ async function main() {
     done++;
     process.stdout.write(`\r  [${done}/${availableStocks.length}] ${stock.ticker.padEnd(6)} `);
 
-    // Fetch Hyperliquid funding rate for this stock perp
+    // Fetch Hyperliquid funding rate for this stock perp (use mapped HL ticker)
+    const hlTicker = stockToHL.get(stock.ticker) || stock.hyperliquidTicker;
     let hlFunding: FundingRateEntry[] = [];
     try {
       hlFunding = await Promise.race([
-        hl.fetchFundingRates(stock.hyperliquidTicker, startTime, endTime),
+        hl.fetchFundingRates(hlTicker, startTime, endTime),
         new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 25000)),
       ]);
     } catch {}
@@ -781,7 +854,10 @@ async function main() {
 
   console.log();
   console.log("=".repeat(W));
-  console.log(`  Re-run: bun run stocks ${stocks.map((s) => s.ticker).join(" ")} --capital ${CAPITAL} --days ${DAYS} --spot ${SPOT_VENUE}`);
+  const hlMapStr = HL_TICKER_MAP.size > 0
+    ? ` --hl-map ${Array.from(HL_TICKER_MAP.entries()).map(([k, v]) => `${k}:${v}`).join(",")}`
+    : "";
+  console.log(`  Re-run: bun run stocks ${stocks.map((s) => s.ticker).join(" ")} --capital ${CAPITAL} --days ${DAYS} --spot ${SPOT_VENUE}${hlMapStr}`);
   console.log("=".repeat(W));
 }
 

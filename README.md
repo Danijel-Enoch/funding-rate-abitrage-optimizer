@@ -1,6 +1,6 @@
 # Basis Trading Backtester
 
-Multi-exchange basis trading backtester and arbitrage scanner. Scans funding rate differentials across 11 perp exchanges and 5 spot venues to find profitable basis trades.
+Multi-exchange basis trading backtester and arbitrage scanner. Scans funding rate differentials across 11 perp exchanges and 7 spot venues to find profitable basis trades — including tokenized stocks on BSC via Uniswap/PancakeSwap with HIP-3 perps on Hyperliquid.
 
 ## Setup
 
@@ -68,6 +68,46 @@ bun run optimize-markets ETH SOL BTC                  # Specific coins
 bun run optimize-markets --category L1 --min-profit 0.2  # Combined filters
 ```
 
+### Basket Optimization (Multi-Coin)
+
+Finds the best venue pair for a basket of crypto tokens.
+
+```bash
+bun run basket BTC ETH SOL                  # Specific coins
+bun run basket --category L1                # All L1 coins
+bun run basket --category DeFi              # All DeFi coins
+bun run basket BTC ETH --min-profit 0.5     # Filter by min profit
+bun run basket --strategy spot_vs_perp      # Spot vs perp only
+```
+
+### Stock Basket Optimization
+
+Finds the best venue pair for tokenized stocks. Long stock on Uniswap/PancakeSwap (BSC) + Short stock perp on Hyperliquid HIP-3 or Lighter.
+
+```bash
+bun run stocks TSLA NVDA AAPL               # Specific stocks
+bun run stocks --all                        # All available stocks
+bun run stocks --category mega              # Mega cap tech
+bun run stocks --category semi              # Semiconductors
+bun run stocks --category crypto            # Crypto-adjacent (COIN, MSTR, HOOD, PLTR)
+bun run stocks --category etf               # ETFs (SPY, QQQ)
+bun run stocks --category space             # Space (SPCX)
+bun run stocks --spot uniswap               # Uniswap BSC only
+bun run stocks --spot pancakeswap           # PancakeSwap BSC only
+bun run stocks --spot all                   # All spot venues (default)
+bun run stocks --discover                   # Discover pools on Uniswap BSC
+bun run stocks --days 30 --capital 100000   # Custom period and capital
+bun run stocks TSLA --hl-map TSLA:TSLAUSD   # Manual HL ticker override
+```
+
+**How it works:**
+1. Discovers tokenized stocks on BSC (bStocks, Ondo) via Uniswap V3 / PancakeSwap
+2. Fetches funding rates from Hyperliquid HIP-3 stock perps (`xyz:TSLA`, `xyz:NVDA`, etc.) and Lighter
+3. Tests every combination: `{Uniswap|PancakeSwap|BSC Stocks} × {Hyperliquid|Lighter} × {exit-on-neg|hold}`
+4. Ranks by total PnL, outputs action plan with winners/losers
+
+**Supported stocks:** TSLA, NVDA, AAPL, MSFT, GOOGL, AMZN, META, NFLX, AMD, MU, INTC, AVGO, ARM, TSM, CRWV, ORCL, COIN, MSTR, HOOD, PLTR, SPCX, SPY, QQQ
+
 ### Correlation Analysis
 
 Analyzes correlation between funding rate duration patterns and backtest profitability.
@@ -103,29 +143,31 @@ bun run tui                          # Interactive terminal UI
 
 ### Perp Exchanges (11)
 
-| Exchange | Type | Fee (Taker) |
-|----------|------|-------------|
-| Hyperliquid | CLOB | 3.5 bps |
-| Lighter | AMM | 2 bps |
-| Aster | CLOB | 4 bps |
-| Extended | CLOB | 4 bps |
-| Paradex | CLOB | 5.5 bps |
-| Nado | CLOB | 5 bps |
-| GMX | AMM | 5 bps |
-| Binance Perp | CLOB | 4 bps |
-| Bybit Perp | CLOB | 5.5 bps |
-| OKX Perp | CLOB | 5 bps |
-| MEXC Perp | CLOB | 4 bps |
+| Exchange | Type | Fee (Taker) | Notes |
+|----------|------|-------------|-------|
+| Hyperliquid | CLOB | 3.5 bps | Main dex (crypto) + HIP-3 dexes (stocks, indices) |
+| Lighter | AMM | 2 bps | Stock perps available |
+| Aster | CLOB | 4 bps | |
+| Extended | CLOB | 4 bps | |
+| Paradex | CLOB | 5.5 bps | |
+| Nado | CLOB | 5 bps | |
+| GMX | AMM | 5 bps | |
+| Binance Perp | CLOB | 4 bps | |
+| Bybit Perp | CLOB | 5.5 bps | |
+| OKX Perp | CLOB | 5 bps | |
+| MEXC Perp | CLOB | 4 bps | |
 
-### Spot Exchanges (5)
+### Spot Exchanges (7)
 
-| Exchange | Type | Fee (Taker) |
-|----------|------|-------------|
-| Uniswap (DEX) | AMM | ~30 bps |
-| Binance Spot | CLOB | 10 bps |
-| Bybit Spot | CLOB | 10 bps |
-| OKX Spot | CLOB | 10 bps |
-| MEXC Spot | CLOB | 10 bps |
+| Exchange | Type | Fee (Taker) | Notes |
+|----------|------|-------------|-------|
+| Uniswap (DEX) | AMM | ~30 bps | Crypto via CoinGecko/DeFi Llama |
+| Uniswap BSC Stocks | AMM | ~5 bps | Tokenized stocks (bStocks, Ondo) |
+| PancakeSwap BSC | AMM | ~2.5 bps | Tokenized stocks (bStocks, Ondo) |
+| Binance Spot | CLOB | 10 bps | |
+| Bybit Spot | CLOB | 10 bps | |
+| OKX Spot | CLOB | 10 bps | |
+| MEXC Spot | CLOB | 10 bps | |
 
 ## Strategies
 
@@ -138,6 +180,11 @@ bun run tui                          # Interactive terminal UI
 - Long perp on Exchange A + Short perp on Exchange B
 - Profit from funding rate differential between venues
 - 3x leverage on both legs
+
+### Tokenized Stock Basis (Stock Basket)
+- Long tokenized stock on BSC DEX (Uniswap/PancakeSwap) + Short stock perp on Hyperliquid HIP-3 or Lighter
+- Real stock prices (Yahoo Finance) as proxy for BSC tokenized stocks (1:1 tracking)
+- HIP-3 assets: `xyz:TSLA`, `xyz:NVDA`, `xyz:SPCX`, etc.
 
 ## Output Columns
 
@@ -169,9 +216,21 @@ bun run tui                          # Interactive terminal UI
 | Win% | Win rate |
 | Liq | Liquidation events (if any) |
 
+### Stock Basket Output
+
+| Section | Description |
+|---------|-------------|
+| Top Venue Pairs | All combos ranked by total PnL |
+| Best Venue | Winner with full stats |
+| Per-Stock Breakdown | Individual stock PnL, Sharpe, fees, funding |
+| Spot Venue Comparison | Uniswap vs PancakeSwap vs BSC Stocks |
+| Hyperliquid vs Lighter | Perp venue comparison |
+| Action Plan | Trade list + skip list + where to buy |
+
 ## Markets
 
-80+ coins across categories:
+### Crypto (180+)
+
 - **L1**: BTC, ETH, SOL, BNB, XRP, ADA, DOGE, AVAX, DOT, LINK, MATIC, ATOM, LTC, NEAR, APT, SUI, TON, HBAR, etc.
 - **L2**: ARB, OP, MATIC, STRK, zkSync, Mantle, Immutable, etc.
 - **DeFi**: AAVE, UNI, MKR, LDO, CRV, DYDX, PENDLE, ENA, JUP, Raydium, etc.
@@ -181,6 +240,34 @@ bun run tui                          # Interactive terminal UI
 - **RWA**: Ondo, Mantra, Polymesh, etc.
 - **GameFi**: Immutable, Gala, Beam, etc.
 
+### Tokenized Stocks (23)
+
+| Ticker | Name | Category | Hyperliquid | Lighter | BSC Tokens |
+|--------|------|----------|-------------|---------|------------|
+| TSLA | Tesla | Mega Cap | `xyz:TSLA` | TSLA | TSLAB, TSLAon |
+| NVDA | NVIDIA | Mega Cap | `xyz:NVDA` | - | NVDAB, NVDAon |
+| AAPL | Apple | Mega Cap | `xyz:AAPL` | - | AAPLon |
+| MSFT | Microsoft | Mega Cap | `xyz:MSFT` | MSFT | MSFTB, MSFTon |
+| GOOGL | Alphabet | Mega Cap | `xyz:GOOGL` | GOOGL | GOOGLon |
+| AMZN | Amazon | Mega Cap | `xyz:AMZN` | - | AMZNon |
+| META | Meta | Mega Cap | `xyz:META` | - | METAB |
+| NFLX | Netflix | Mega Cap | `xyz:NFLX` | - | NFLXon |
+| AMD | AMD | Semi | `xyz:AMD` | - | AMDB |
+| MU | Micron | Semi | `xyz:MU` | - | MUB |
+| INTC | Intel | Semi | `xyz:INTC` | - | INTCB |
+| AVGO | Broadcom | Semi | `xyz:AVGO` | - | AVGOon |
+| ARM | ARM | Semi | `xyz:ARM` | - | ARMon |
+| TSM | TSMC | Semi | `xyz:TSM` | - | TSMon |
+| CRWV | CoreWeave | Semi | `xyz:CRWV` | - | CRWVon |
+| ORCL | Oracle | Semi | `xyz:ORCL` | - | ORCLon |
+| COIN | Coinbase | Crypto | `xyz:COIN` | - | COINon |
+| MSTR | MicroStrategy | Crypto | `xyz:MSTR` | - | MSTRB |
+| HOOD | Robinhood | Crypto | `xyz:HOOD` | - | HOODon |
+| PLTR | Palantir | Crypto | `xyz:PLTR` | - | PLTRB |
+| SPCX | SpaceX | Space | `xyz:SPCX` | - | SPCXon |
+| SPY | S&P 500 | ETF | `xyz:SP500` | SPY | SPYon |
+| QQQ | Nasdaq 100 | ETF | `xyz:QQQ` | QQQ | QQQB |
+
 ## File Structure
 
 ```
@@ -188,9 +275,11 @@ src/
 ├── index.ts                # CLI entry point (backtest, optimize, list)
 ├── backtest.ts             # Backtesting engine
 ├── optimize.ts             # Venue optimization + crossover analysis
+├── optimize-basket.ts      # Multi-coin basket venue pair optimizer
+├── optimize-stocks.ts      # Stock basket venue pair optimizer
 ├── optimize-markets.ts     # 24h market scanner
 ├── scanner.ts              # Live funding rate scanner
-├── markets.ts              # Market definitions (~80+ coins)
+├── markets.ts              # Market definitions (~180+ crypto + 50 traditional)
 ├── correlation.ts          # Funding duration vs profitability analysis
 ├── funding-duration.ts     # Funding rate streak analysis
 ├── analyze-funding.ts      # Funding rate duration stats
@@ -200,8 +289,8 @@ src/
 ├── uniswap.ts              # Legacy spot client
 └── exchanges/
     ├── types.ts            # Unified exchange interfaces
-    ├── index.ts            # Exchange registry
-    ├── hyperliquid.ts      # Hyperliquid adapter
+    ├── index.ts            # Exchange registry (11 perp + 7 spot)
+    ├── hyperliquid.ts      # Hyperliquid adapter (main + HIP-3 dexes)
     ├── lighter.ts          # Lighter adapter
     ├── aster.ts            # Aster adapter
     ├── extended.ts         # Extended adapter
@@ -212,8 +301,10 @@ src/
     ├── bybit.ts            # Bybit perp adapter
     ├── okx.ts              # OKX perp adapter
     ├── mexc.ts             # MEXC perp adapter
-    ├── binance.ts          # Binance spot adapter (legacy)
-    ├── uniswap.ts          # Uniswap/DEX spot adapter
+    ├── binance.ts          # Binance spot adapter
+    ├── uniswap.ts          # Uniswap/DEX spot adapter (crypto)
+    ├── uniswap-stocks.ts   # Uniswap BSC tokenized stocks adapter
+    ├── bsc-stocks.ts       # BSC tokenized stocks registry
     ├── bybit-spot.ts       # Bybit spot adapter
     ├── okx-spot.ts         # OKX spot adapter
     └── mexc-spot.ts        # MEXC spot adapter

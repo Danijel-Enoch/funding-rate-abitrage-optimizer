@@ -12,13 +12,13 @@
  */
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid";
-import { BinanceSpotExchange } from "./exchanges/binance";
+import { UniswapSpotExchange } from "./exchanges/uniswap";
 import { runBacktest, type BacktestConfig } from "./backtest";
 import { MARKETS, getCategories, getMarketsByCategory, type MarketConfig } from "./markets";
-import { optimizeCoin } from "./optimize";
+import { optimizeCoin, analyzeCrossovers } from "./optimize";
 
 const hl = new HyperliquidExchange();
-const binance = new BinanceSpotExchange();
+const spot = new UniswapSpotExchange();
 
 const args = process.argv.slice(2);
 let MODE = "ETH";
@@ -62,10 +62,23 @@ async function runSingleBacktest(market: MarketConfig, days: number, capital: nu
   const startTime = endTime - days * 24 * 60 * 60 * 1000;
 
   try {
-    const ratesA = await hl.fetchFundingRates(market.hlCoin, startTime, endTime);
-    const prices = await binance.fetchPrices(market.binanceSymbol, startTime, endTime);
+    const ratesA = await Promise.race([
+      hl.fetchFundingRates(market.hlCoin, startTime, endTime),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("HL timeout")), 20000)),
+    ]);
+    const prices = await Promise.race([
+      spot.fetchPrices(market.binanceSymbol, startTime, endTime),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("Spot timeout")), 20000)),
+    ]);
 
-    if (ratesA.length === 0 || prices.length === 0) return null;
+    if (ratesA.length === 0) {
+      console.error(`  ${market.hlCoin}: no HL funding data`);
+      return null;
+    }
+    if (prices.length === 0) {
+      console.error(`  ${market.hlCoin}: no Binance price data`);
+      return null;
+    }
 
     // Create synthetic spot funding (0 for all)
     const ratesB = ratesA.map((r) => ({ ...r, fundingRate: 0, coin: "spot" }));
@@ -82,7 +95,8 @@ async function runSingleBacktest(market: MarketConfig, days: number, capital: nu
 
     const result = runBacktest(ratesA, ratesB, config);
     return { market, result };
-  } catch {
+  } catch (e: any) {
+    console.error(`  ${market.hlCoin}: ${e?.message ?? "fetch failed"}`);
     return null;
   }
 }
@@ -95,6 +109,16 @@ function printResult(market: MarketConfig, result: any, capital: number) {
   const sr = result.sharpeRatio.toFixed(1);
   const trades = result.totalTrades;
   const pnl = result.totalPnl.toFixed(0);
+  const be = result.breakevenHours;
+
+  let beStr: string;
+  if (be < 0) {
+    beStr = "never";
+  } else if (be < 24) {
+    beStr = `${be}h`;
+  } else {
+    beStr = `${(be / 24).toFixed(1)}d`;
+  }
 
   console.log(
     `  ${market.hlCoin.padEnd(8)}` +
@@ -105,7 +129,8 @@ function printResult(market: MarketConfig, result: any, capital: number) {
     `${(ret + "%").padStart(8)}` +
     `${(ann + "%").padStart(8)}` +
     `${(dd + "%").padStart(7)}` +
-    `${sr.padStart(7)}`
+    `${sr.padStart(7)}` +
+    `${beStr.padStart(8)}`
   );
 }
 
@@ -241,7 +266,7 @@ async function main() {
     }
 
     console.log();
-    console.log("=".repeat(90));
+    console.log("=".repeat(98));
     console.log(
       "  " +
       "#".padStart(3) +
@@ -253,9 +278,11 @@ async function main() {
       "Trades".padStart(7) +
       "Win%".padStart(6) +
       "MDD%".padStart(7) +
-      "Score".padStart(8)
+      "Score".padStart(8) +
+      "Breach".padStart(8) +
+      "Liq".padStart(6)
     );
-    console.log("-".repeat(90));
+    console.log("-".repeat(104));
 
     for (let i = 0; i < Math.min(results.length, 15); i++) {
       const r = results[i];
@@ -269,12 +296,27 @@ async function main() {
       const score = `${r.score.toFixed(0)}`.padStart(8);
 
       const medal = i === 0 ? " <- BEST" : "";
-      console.log(`  ${(i + 1 + ".").padStart(4)} ${strat.padEnd(14)}${pair}${pnl}${fees}${trades}${win}${dd}${score}${medal}`);
+      const be = r.result.breakevenHours;
+      let beStr: string;
+      if (be < 0) beStr = "never";
+      else if (be < 24) beStr = `${be}h`;
+      else beStr = `${(be / 24).toFixed(1)}d`;
+      const liqCount = r.result.liquidationEvents.length;
+      const liqStr = liqCount > 0
+        ? `${liqCount}!`.padStart(6)
+        : "  -".padStart(6);
+      console.log(`  ${(i + 1 + ".").padStart(4)} ${strat.padEnd(14)}${pair}${pnl}${fees}${trades}${win}${dd}${score}${beStr.padStart(8)}${liqStr}${medal}`);
     }
 
-    console.log("-".repeat(90));
+    console.log("-".repeat(104));
 
     const best = results[0];
+    const bestBe = best.result.breakevenHours;
+    let bestBeStr: string;
+    if (bestBe < 0) bestBeStr = "never";
+    else if (bestBe < 24) bestBeStr = `${bestBe} hours`;
+    else bestBeStr = `${(bestBe / 24).toFixed(1)} days`;
+
     console.log();
     console.log(`  BEST: ${best.combo.label}`);
     console.log(`  Strategy:    ${best.combo.strategy === "spot_vs_perp" ? "Spot vs Perp (2x perp)" : "Perp vs Perp (3x both)"}`);
@@ -284,16 +326,144 @@ async function main() {
     console.log(`  Trades:      ${best.result.totalTrades}`);
     console.log(`  Win Rate:    ${(best.result.winRate * 100).toFixed(1)}%`);
     console.log(`  Max DD:      ${best.maxDrawdownPct.toFixed(2)}%`);
-    console.log(`  Score:       ${best.score.toFixed(2)}`);
+    console.log(`  Breakeven:   ${bestBeStr}`);
+    if (best.result.liquidationEvents.length > 0) {
+      console.log(`  LIQUIDATIONS: ${best.result.liquidationEvents.length} events, $${best.result.totalLiquidationLoss.toFixed(0)} lost`);
+    } else {
+      console.log(`  Liquidations: none (price never breached margin)`);
+    }
+
+    // Trade breakdown
+    if (best.result.trades.length > 0) {
+      console.log();
+      console.log("  TRADE BREAKDOWN");
+      console.log("  " + "-".repeat(112));
+      console.log(
+        "  " +
+        "#".padStart(3) +
+        "  " +
+        "Entry".padEnd(18) +
+        "Duration".padStart(10) +
+        "  " +
+        "PnL".padStart(10) +
+        "Fees".padStart(9) +
+        "Funding".padStart(10) +
+        "  " +
+        "Expected".padStart(10) +
+        "Actual".padStart(10) +
+        "  " +
+        "Diff".padEnd(12) +
+        "Liquidated".padEnd(14)
+      );
+      console.log("  " + "-".repeat(112));
+
+      for (let i = 0; i < best.result.trades.length; i++) {
+        const t = best.result.trades[i];
+        const entryStr = t.entryTime.toISOString().slice(0, 16).replace("T", " ");
+
+        // Duration in hours
+        const entryMs = t.entryTime.getTime();
+        const exitMs = t.exitTime?.getTime() ?? Date.now();
+        const durationH = Math.round((exitMs - entryMs) / (1000 * 60 * 60));
+        let durationStr: string;
+        if (durationH < 24) durationStr = `${durationH}h`;
+        else durationStr = `${(durationH / 24).toFixed(1)}d`;
+
+        // Format expected breakeven
+        const expH = t.expectedBreakevenHours;
+        let expStr: string;
+        if (expH >= 999 * 8) expStr = "n/a";
+        else if (expH < 24) expStr = `${expH}h`;
+        else expStr = `${(expH / 24).toFixed(1)}d`;
+
+        // Format actual breakeven
+        const actH = t.actualBreakevenHours;
+        let actStr: string;
+        if (actH < 0) actStr = "never";
+        else if (actH < 24) actStr = `${actH}h`;
+        else actStr = `${(actH / 24).toFixed(1)}d`;
+
+        // Diff: actual - expected (positive = took longer than expected)
+        let diffStr: string;
+        if (actH < 0 || expH >= 999 * 8) diffStr = "n/a";
+        else {
+          const diff = actH - expH;
+          if (diff === 0) diffStr = "on time";
+          else if (diff > 0) diffStr = `+${diff}h late`;
+          else diffStr = `${diff}h early`;
+        }
+
+        const pnlStr = `$${t.pnl.toFixed(0)}`;
+        const feesStr = `$${t.feesPaid.toFixed(0)}`;
+        const fundingNet = t.fundingCollected - t.fundingPaid;
+        const fundingStr = `$${fundingNet.toFixed(0)}`;
+        const liqStr = t.liquidated
+          ? `Leg ${t.liquidatedLeg}! -$${t.liquidationLoss.toFixed(0)}`
+          : "no";
+
+        console.log(
+          `  ${(i + 1 + ".").padStart(4)} ` +
+          `${entryStr.padEnd(18)}` +
+          `${durationStr.padStart(10)}  ` +
+          `${pnlStr.padStart(10)}` +
+          `${feesStr.padStart(9)}` +
+          `${fundingStr.padStart(10)}  ` +
+          `${expStr.padStart(10)}` +
+          `${actStr.padStart(10)}  ` +
+          `${diffStr.padEnd(12)}` +
+          `${liqStr.padEnd(14)}`
+        );
+      }
+      console.log("  " + "-".repeat(112));
+    }
+
+    // Crossover analysis: was another combo better at any point?
+    const crossover = analyzeCrossovers(results);
+    if (crossover && crossover.periods.length > 0) {
+      console.log();
+      console.log("  WAS THE WINNER ALWAYS BEST?");
+      console.log("  " + "-".repeat(100));
+      console.log(`  Winner wasn't #1 for ${crossover.totalHoursBetter}h out of ${crossover.totalHours}h (${crossover.pctTimeNotBest.toFixed(1)}% of the time)`);
+      if (crossover.bestChallenger) {
+        console.log(`  Most persistent challenger: ${crossover.bestChallenger}`);
+      }
+      if (crossover.maxAdvantageCombo) {
+        const maxAdvStr = crossover.maxAdvantage >= 1000
+          ? `$${(crossover.maxAdvantage / 1000).toFixed(1)}k`
+          : `$${crossover.maxAdvantage.toFixed(0)}`;
+        console.log(`  Biggest challenger edge: ${crossover.maxAdvantageCombo} (+${maxAdvStr} over winner)`);
+      }
+      console.log();
+      console.log("  " + "When".padEnd(6) + "Period".padEnd(20) + "Challenger".padEnd(28) + "Challenger PnL".padStart(15) + "Winner PnL".padStart(13) + "Edge".padStart(12));
+      console.log("  " + "-".repeat(100));
+
+      for (const p of crossover.periods) {
+        const startStr = p.start.toISOString().slice(0, 16).replace("T", " ");
+        const endStr = p.end.toISOString().slice(0, 16).replace("T", " ");
+        const periodStr = startStr === endStr ? startStr : `${startStr.slice(5)} → ${endStr.slice(5)}`;
+        const edgeStr = p.advantage >= 1000 ? `$${(p.advantage / 1000).toFixed(1)}k` : `$${p.advantage.toFixed(0)}`;
+        console.log(
+          "  " +
+          "".padEnd(6) +
+          periodStr.padEnd(20) +
+          p.betterCombo.padEnd(28) +
+          `$${p.betterPnl.toFixed(0)}`.padStart(15) +
+          `$${p.winnerPnl.toFixed(0)}`.padStart(13) +
+          `+${edgeStr}`.padStart(12)
+        );
+      }
+      console.log("  " + "-".repeat(100));
+    }
+
     console.log();
-    console.log("=".repeat(90));
+    console.log("=".repeat(98));
     return;
   }
 
-  console.log("=".repeat(110));
+  console.log("=".repeat(118));
   console.log("  DELTA-NEUTRAL BASIS TRADING BACKTEST");
-  console.log("  Hyperliquid vs Binance Spot");
-  console.log("=".repeat(110));
+  console.log("  Hyperliquid vs Uniswap (DeFi Llama)");
+  console.log("=".repeat(118));
   console.log();
 
   let marketsToRun: MarketConfig[] = [];
@@ -321,7 +491,7 @@ async function main() {
   console.log(`Markets:           ${marketsToRun.length}`);
   console.log();
 
-  console.log("=".repeat(110));
+  console.log("=".repeat(118));
   console.log(
     "  " +
     "Coin".padEnd(8) +
@@ -332,9 +502,10 @@ async function main() {
     "Return".padStart(8) +
     "Ann.%".padStart(8) +
     "MDD".padStart(7) +
-    "Sharpe".padStart(7)
+    "Sharpe".padStart(7) +
+    "Breach".padStart(8)
   );
-  console.log("-".repeat(110));
+  console.log("-".repeat(118));
 
   const results: Array<{ market: MarketConfig; result: any }> = [];
 
@@ -353,7 +524,7 @@ async function main() {
     printResult(market, result, INITIAL_CAPITAL);
   }
 
-  console.log("-".repeat(110));
+  console.log("-".repeat(118));
 
   if (results.length > 0) {
     const totalPnl = results.reduce((s, r) => s + r.result.totalPnl, 0);
@@ -368,7 +539,7 @@ async function main() {
   }
 
   console.log();
-  console.log("=".repeat(110));
+  console.log("=".repeat(118));
 }
 
 main().catch(console.error);

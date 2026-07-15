@@ -8,7 +8,11 @@
     "backtest": "bun run src/index.ts",
     "optimize": "bun run src/index.ts --optimize",
     "markets": "bun run src/index.ts --markets",
-    "list": "bun run src/index.ts --list"
+    "list": "bun run src/index.ts --list",
+    "correlation": "bun run src/correlation.ts",
+    "scan": "bun run src/scanner.ts",
+    "optimize-markets": "bun run src/optimize-markets.ts",
+    "basket": "bun run src/optimize-basket.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

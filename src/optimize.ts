@@ -9,6 +9,7 @@
  */
 
 import { perpExchanges, spotExchanges, getPerpExchange, getSpotExchange } from "./exchanges";
+import { UniswapSpotExchange } from "./exchanges/uniswap";
 import { runBacktest, EXCHANGE_FEES, type BacktestConfig, type BacktestResult, type FeeModel } from "./backtest";
 import type { FundingRateEntry } from "./exchanges/types";
 import { TRADITIONAL_MARKETS } from "./markets";
@@ -30,6 +31,156 @@ export interface OptimizationResult {
   maxDrawdownPct: number;
   score: number;           // composite score: PnL - (drawdown penalty)
   exitOnNegative: boolean; // whether this uses exit-on-negative-funding mode
+}
+
+export interface CrossoverPeriod {
+  start: Date;
+  end: Date;
+  betterCombo: string;     // name of the combo that was better
+  betterPnl: number;       // that combo's PnL at end of period
+  winnerPnl: number;       // winner's PnL at end of period
+  advantage: number;       // how much better (betterPnl - winnerPnl)
+}
+
+export interface CrossoverAnalysis {
+  totalHoursBetter: number;           // hours the winner was NOT #1
+  totalHours: number;                 // total hours in the backtest
+  pctTimeNotBest: number;             // % of time winner wasn't best
+  periods: CrossoverPeriod[];         // individual periods where someone else was better
+  bestChallenger: string | null;      // the combo that spent the most time beating the winner
+  maxAdvantage: number;               // biggest advantage any challenger had over the winner
+  maxAdvantageCombo: string | null;   // which combo had that max advantage
+}
+
+export function analyzeCrossovers(
+  results: OptimizationResult[],
+  maxChallengers = 10
+): CrossoverAnalysis | null {
+  if (results.length < 2) return null;
+
+  const winner = results[0];
+  const winnerTimestamps = winner.result.timestamps;
+  const winnerHistory = winner.result.pnlHistory;
+
+  if (winnerTimestamps.length === 0) return null;
+
+  // Take up to maxChallengers other combos
+  const challengers = results.slice(1, maxChallengers + 1);
+
+  // Build a map of timestamp -> { comboLabel: pnl } for all combos
+  // Find overlapping timestamps
+  const winnerTsSet = new Set(winnerTimestamps);
+  const overlappingTs: number[] = [];
+  for (let i = 0; i < winnerTimestamps.length; i++) {
+    // Check if at least one challenger has this timestamp
+    const ts = winnerTimestamps[i];
+    const hasChallenger = challengers.some((c) =>
+      c.result.timestamps.some((t) => Math.abs(t - ts) < 3600 * 1000) // within 1 hour
+    );
+    if (hasChallenger) overlappingTs.push(ts);
+  }
+
+  if (overlappingTs.length === 0) return null;
+
+  // For each overlapping timestamp, find the best challenger PnL
+  const periods: CrossoverPeriod[] = [];
+  let currentPeriod: CrossoverPeriod | null = null;
+  let totalHoursBetter = 0;
+
+  for (let i = 0; i < overlappingTs.length; i++) {
+    const ts = overlappingTs[i];
+    const winnerIdx = winnerTimestamps.findIndex((t) => Math.abs(t - ts) < 3600 * 1000);
+    if (winnerIdx < 0) continue;
+    const winnerPnl = winnerHistory[winnerIdx];
+
+    // Find best challenger at this timestamp
+    let bestChallengerLabel = "";
+    let bestChallengerPnl = -Infinity;
+
+    for (const ch of challengers) {
+      const chIdx = ch.result.timestamps.findIndex((t) => Math.abs(t - ts) < 3600 * 1000);
+      if (chIdx < 0) continue;
+      const chPnl = ch.result.pnlHistory[chIdx];
+      if (chPnl > bestChallengerPnl) {
+        bestChallengerPnl = chPnl;
+        bestChallengerLabel = ch.combo.label;
+      }
+    }
+
+    if (bestChallengerPnl > winnerPnl) {
+      // Challenger is winning
+      if (currentPeriod && currentPeriod.betterCombo === bestChallengerLabel) {
+        // Extend current period
+        currentPeriod.end = new Date(ts);
+        currentPeriod.betterPnl = bestChallengerPnl;
+        currentPeriod.winnerPnl = winnerPnl;
+        currentPeriod.advantage = bestChallengerPnl - winnerPnl;
+      } else {
+        // Start new period
+        if (currentPeriod) periods.push(currentPeriod);
+        currentPeriod = {
+          start: new Date(ts),
+          end: new Date(ts),
+          betterCombo: bestChallengerLabel,
+          betterPnl: bestChallengerPnl,
+          winnerPnl,
+          advantage: bestChallengerPnl - winnerPnl,
+        };
+      }
+    } else {
+      // Winner is ahead
+      if (currentPeriod) {
+        periods.push(currentPeriod);
+        currentPeriod = null;
+      }
+    }
+  }
+  if (currentPeriod) periods.push(currentPeriod);
+
+  // Calculate hours
+  for (const p of periods) {
+    const hours = Math.round((p.end.getTime() - p.start.getTime()) / (1000 * 60 * 60));
+    totalHoursBetter += hours || 1; // at least 1 hour per period
+  }
+
+  const totalHours = Math.round(
+    (winnerTimestamps[winnerTimestamps.length - 1] - winnerTimestamps[0]) / (1000 * 60 * 60)
+  );
+
+  // Find the challenger that spent the most time beating the winner
+  const challengerTime: Record<string, number> = {};
+  for (const p of periods) {
+    const hours = Math.round((p.end.getTime() - p.start.getTime()) / (1000 * 60 * 60)) || 1;
+    challengerTime[p.betterCombo] = (challengerTime[p.betterCombo] || 0) + hours;
+  }
+  let bestChallengerName: string | null = null;
+  let maxTime = 0;
+  for (const [name, hours] of Object.entries(challengerTime)) {
+    if (hours > maxTime) {
+      maxTime = hours;
+      bestChallengerName = name;
+    }
+  }
+
+  // Find max advantage
+  let maxAdv = 0;
+  let maxAdvCombo: string | null = null;
+  for (const p of periods) {
+    if (p.advantage > maxAdv) {
+      maxAdv = p.advantage;
+      maxAdvCombo = p.betterCombo;
+    }
+  }
+
+  return {
+    totalHoursBetter,
+    totalHours,
+    pctTimeNotBest: totalHours > 0 ? (totalHoursBetter / totalHours) * 100 : 0,
+    periods,
+    bestChallenger: bestChallengerName,
+    maxAdvantage: maxAdv,
+    maxAdvantageCombo: maxAdvCombo,
+  };
 }
 
 // Score = PnL - (max drawdown * penalty factor)
@@ -149,6 +300,16 @@ export async function optimizeCoin(
     }
   }
 
+  // Fetch price data from Uniswap (DeFi Llama) for liquidation checks
+  let priceData: Array<{ timestamp: number; price: number }> = [];
+  try {
+    const uni = new UniswapSpotExchange();
+    const symbol = coin.endsWith("USDT") ? coin : `${coin}USDT`;
+    priceData = await uni.fetchPrices(symbol, startTime, endTime);
+  } catch {
+    priceData = [];
+  }
+
   const results: OptimizationResult[] = [];
 
   for (let i = 0; i < combos.length; i++) {
@@ -201,6 +362,7 @@ export async function optimizeCoin(
           exitOnNegativeFunding: exitOnNeg,
           perpLeverageA: combo.strategy === "perp_vs_perp" ? 3 : 2,
           perpLeverageB: combo.strategy === "perp_vs_perp" ? 3 : 2,
+          priceData,
         };
 
         const result = runBacktest(ratesA, ratesB, config);

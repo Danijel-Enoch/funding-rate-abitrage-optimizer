@@ -15,22 +15,76 @@ export class UniswapSpotExchange implements SpotExchange {
   info = uniswapInfo;
 
   async fetchPrices(symbol: string, startTime: number, endTime: number): Promise<Array<{ timestamp: number; price: number }>> {
-    // Map symbol to DeFi Llama coin ID
-    const coinId = this.symbolToCoinId(symbol);
-    if (!coinId) throw new Error(`Unknown symbol: ${symbol}`);
+    // Use CoinGecko for reliable hourly price data
+    const coinId = this.symbolToCoinGeckoId(symbol);
+    if (!coinId) {
+      // Fallback to DeFi Llama
+      return this.fetchFromDeFiLlama(symbol, startTime, endTime);
+    }
 
-    const url = `https://coins.llama.fi/chart/${coinId}?start=${Math.floor(startTime / 1000)}&period=1h`;
+    const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart/range?vs_currency=usd&from=${Math.floor(startTime / 1000)}&to=${Math.floor(endTime / 1000)}`;
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`DeFi Llama API ${res.status}`);
+    if (!res.ok) return this.fetchFromDeFiLlama(symbol, startTime, endTime);
     const data = await res.json() as any;
+    if (!data.prices?.length) return [];
 
-    const coinData = data.coins?.[coinId];
-    if (!coinData?.prices) return [];
-
-    return coinData.prices.map((p: any) => ({
-      timestamp: p.timestamp * 1000,
-      price: p.price,
+    return data.prices.map((p: [number, number]) => ({
+      timestamp: p[0],
+      price: p[1],
     }));
+  }
+
+  private async fetchFromDeFiLlama(symbol: string, startTime: number, endTime: number): Promise<Array<{ timestamp: number; price: number }>> {
+    const coinId = this.symbolToCoinId(symbol);
+    if (!coinId) return [];
+
+    const allPrices: Array<{ timestamp: number; price: number }> = [];
+    const chunkMs = 168 * 3600 * 1000;
+    let chunkStart = startTime;
+
+    while (chunkStart < endTime) {
+      const chunkEnd = Math.min(chunkStart + chunkMs, endTime);
+      const spanHours = Math.ceil((chunkEnd - chunkStart) / (3600 * 1000)) + 1;
+      const url = `https://coins.llama.fi/chart/${coinId}?start=${Math.floor(chunkEnd / 1000)}&span=${spanHours}&period=1h`;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) { chunkStart = chunkEnd; continue; }
+        const data = await res.json() as any;
+        const coinData = data.coins?.[coinId];
+        if (coinData?.prices) {
+          for (const p of coinData.prices) {
+            const ts = p.timestamp * 1000;
+            if (ts >= startTime && ts <= endTime) {
+              allPrices.push({ timestamp: ts, price: p.price });
+            }
+          }
+        }
+      } catch {}
+      chunkStart = chunkEnd;
+    }
+
+    const seen = new Map<number, number>();
+    for (const p of allPrices) seen.set(p.timestamp, p.price);
+    return Array.from(seen.entries())
+      .map(([timestamp, price]) => ({ timestamp, price }))
+      .sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  private symbolToCoinGeckoId(symbol: string): string | null {
+    const base = symbol.replace("USDT", "").replace("USD", "");
+    const map: Record<string, string> = {
+      BTC: "bitcoin", ETH: "ethereum", SOL: "solana",
+      DOGE: "dogecoin", XRP: "ripple", ADA: "cardano",
+      AVAX: "avalanche-2", LINK: "chainlink", DOT: "polkadot",
+      MATIC: "matic-network", UNI: "uniswap", AAVE: "aave",
+      CRV: "curve-dao-token", LDO: "lido-dao", SUSHI: "sushi",
+      COMP: "compound-governance-token", MKR: "maker", SNX: "havven",
+      INJ: "injective-protocol", NEAR: "near", SUI: "sui",
+      APT: "aptos", OP: "optimism", ARB: "arbitrum",
+      PEPE: "pepe", SHIB: "shiba-inu", WIF: "dogwifhat",
+      BONK: "bonk", FIL: "filecoin",
+    };
+    return map[base] || null;
   }
 
   async getAvailableSymbols(): Promise<string[]> {

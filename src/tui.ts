@@ -86,7 +86,7 @@ async function runOptimize() {
   clear();
   banner();
   console.log(`\n  OPTIMIZATION RESULTS — ${coin} (${days} days, $${capital.toLocaleString()})\n`);
-  console.log("  Ranked by: Net PnL - Drawdown Penalty (favors high profit, low risk)\n`);
+  console.log("  Ranked by: Net PnL - Drawdown Penalty (favors high profit, low risk)\n");
   divider();
   console.log(
     "  " +

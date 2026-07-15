@@ -287,18 +287,29 @@ async function main() {
     process.exit(1);
   }
 
-  // Check which Hyperliquid coins are available
-  console.log("  Checking Hyperliquid availability...");
-  let hlCoins: string[] = [];
+  // Check which Hyperliquid coins are available (main dex + HIP-3 dexes)
+  console.log("  Checking Hyperliquid availability (main + HIP-3 dexes)...");
+  const allHLCoinMap = new Map<string, string[]>(); // dex -> coins[]
+
   try {
-    hlCoins = await hl.getAvailableCoins();
+    const dexCoins = await hl.getAllCoinsWithDexes();
+    for (const [dex, coins] of dexCoins) {
+      allHLCoinMap.set(dex, coins);
+    }
   } catch {
     console.log("  WARNING: Could not fetch Hyperliquid coins");
   }
 
-  const hlAvailable = new Set(hlCoins.map((c) => c.toUpperCase()));
+  // Flat list of all coins across all dexes
+  const allHLCoinNames: string[] = [];
+  for (const coins of allHLCoinMap.values()) {
+    allHLCoinNames.push(...coins);
+  }
+  const hlAvailable = new Set(allHLCoinNames.map((c) => c.toUpperCase()));
 
-  // Fuzzy match: Hyperliquid may use variations like TSLAUSD, stock:TSLA, tsla, etc.
+  console.log(`  Hyperliquid: ${allHLCoinNames.length} coins across ${allHLCoinMap.size} dexes`);
+
+  // Find matching HIP-3 ticker for a stock
   function findHLTicker(stock: TokenizedStock): string | null {
     const ticker = stock.hyperliquidTicker.toUpperCase();
 
@@ -308,28 +319,26 @@ async function main() {
       if (hlAvailable.has(mapped.toUpperCase())) return mapped;
     }
 
-    // 1. Exact match
-    if (hlAvailable.has(ticker)) return ticker;
-
-    // 2. Check with USD suffix (TSLAUSD, TSLA/USD, etc.)
-    for (const suffix of ["USD", "/USD", "-USD"]) {
-      if (hlAvailable.has(ticker + suffix)) return ticker + suffix;
-    }
-
-    // 3. Check with prefix variations (stock:TSLA, xyz:TSLA, etc.)
-    for (const coin of hlCoins) {
-      const upper = coin.toUpperCase();
-      // HIP-3 format: "dex:COIN"
-      if (upper.includes(":")) {
-        const parts = upper.split(":");
-        if (parts[1] === ticker || parts[1].startsWith(ticker)) return coin;
+    // 1. Search HIP-3 dexes for "dex:TICKER" format
+    for (const [dex, coins] of allHLCoinMap) {
+      if (!dex) continue; // skip main dex
+      for (const coin of coins) {
+        const upper = coin.toUpperCase();
+        // HIP-3 format: "dex:COIN" -> check if COIN part matches
+        if (upper.includes(":")) {
+          const coinPart = upper.split(":")[1];
+          if (coinPart === ticker) return coin;
+        }
       }
     }
 
-    // 4. Fuzzy: any coin that starts with or contains the ticker
-    for (const coin of hlCoins) {
+    // 2. Exact match on main dex
+    if (hlAvailable.has(ticker)) return ticker;
+
+    // 3. Fuzzy match across all dexes (TSLAUSD, etc.)
+    for (const coin of allHLCoinNames) {
       const upper = coin.toUpperCase();
-      if (upper === ticker || upper.startsWith(ticker) || upper.endsWith(ticker)) return coin;
+      if (upper.startsWith(ticker) || upper.endsWith(ticker)) return coin;
     }
 
     return null;
@@ -349,14 +358,13 @@ async function main() {
   if (availableStocks.length === 0) {
     console.error("  None of the requested stocks are available on Hyperliquid.");
     console.log(`  Requested: ${stocks.map((s) => s.ticker).join(", ")}`);
-    console.log(`  Hyperliquid has ${hlAvailable.size} coins`);
-    // Show some stock-like tickers for debugging
-    const stockLike = hlCoins.filter((c) => {
-      const u = c.toUpperCase();
-      return u.includes("TSLA") || u.includes("NVDA") || u.includes("AAPL") || u.includes("SPY") || u.includes("STOCK") || u.includes("HIP");
-    });
-    if (stockLike.length > 0) {
-      console.log(`  Stock-like tickers found: ${stockLike.join(", ")}`);
+    // Show HIP-3 stocks found
+    for (const [dex, coins] of allHLCoinMap) {
+      if (!dex) continue;
+      const stockCoins = coins.filter((c) => c.includes(":"));
+      if (stockCoins.length > 0) {
+        console.log(`  HIP-3 dex "${dex}": ${stockCoins.slice(0, 10).join(", ")}${stockCoins.length > 10 ? ` (+${stockCoins.length - 10} more)` : ""}`);
+      }
     }
     return;
   }
@@ -365,7 +373,7 @@ async function main() {
   for (const stock of availableStocks) {
     const hlTicker = stockToHL.get(stock.ticker);
     if (hlTicker !== stock.hyperliquidTicker) {
-      console.log(`    ${stock.ticker} -> HL ticker: ${hlTicker}`);
+      console.log(`    ${stock.ticker} -> ${hlTicker}`);
     }
   }
   console.log();

@@ -18,6 +18,8 @@ import { UniswapSpotExchange } from "./uniswap";
 import { BybitSpotExchange } from "./bybit-spot";
 import { OkxSpotExchange } from "./okx-spot";
 import { MexcSpotExchange } from "./mexc-spot";
+import { BscStocksExchange } from "./bsc-stocks";
+import { UniswapStocksExchange } from "./uniswap-stocks";
 
 // Perp exchanges
 export const hyperliquid = new HyperliquidExchange();
@@ -43,8 +45,10 @@ export const perpExchanges: PerpExchange[] = [
   hyperliquid, lighter, aster, extended, paradex, nado, gmx,
   binancePerp, bybit, okx, mexc,
 ];
+export const bscStocks = new BscStocksExchange();
+export const uniswapStocks = new UniswapStocksExchange();
 export const spotExchanges: SpotExchange[] = [
-  binanceSpot, uniswapSpot, bybitSpot, okxSpot, mexcSpot,
+  binanceSpot, uniswapSpot, bybitSpot, okxSpot, mexcSpot, bscStocks, uniswapStocks,
 ];
 
 export function getPerpExchange(id: string): PerpExchange | undefined {

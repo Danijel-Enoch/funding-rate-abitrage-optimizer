@@ -12,7 +12,8 @@
     "correlation": "bun run src/correlation.ts",
     "scan": "bun run src/scanner.ts",
     "optimize-markets": "bun run src/optimize-markets.ts",
-    "basket": "bun run src/optimize-basket.ts"
+    "basket": "bun run src/optimize-basket.ts",
+    "stocks": "bun run src/optimize-stocks.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

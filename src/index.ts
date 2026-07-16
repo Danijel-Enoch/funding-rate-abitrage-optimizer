@@ -13,12 +13,14 @@
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid";
 import { UniswapSpotExchange } from "./exchanges/uniswap";
+import { BinanceSpotExchange } from "./exchanges/binance";
 import { runBacktest, type BacktestConfig } from "./backtest";
 import { MARKETS, getCategories, getMarketsByCategory, type MarketConfig } from "./markets";
 import { optimizeCoin, analyzeCrossovers } from "./optimize";
 
 const hl = new HyperliquidExchange();
 const spot = new UniswapSpotExchange();
+const binanceSpot = new BinanceSpotExchange();
 
 const args = process.argv.slice(2);
 let MODE = "ETH";
@@ -66,22 +68,35 @@ async function runSingleBacktest(market: MarketConfig, days: number, capital: nu
       hl.fetchFundingRates(market.hlCoin, startTime, endTime),
       new Promise<never>((_, rej) => setTimeout(() => rej(new Error("HL timeout")), 20000)),
     ]);
-    const prices = await Promise.race([
-      spot.fetchPrices(market.binanceSymbol, startTime, endTime),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("Spot timeout")), 20000)),
+
+    // Fetch prices from both exchanges in parallel for price spread tracking
+    const [pricesHL, pricesBinance] = await Promise.all([
+      Promise.race([
+        spot.fetchPrices(market.binanceSymbol, startTime, endTime),
+        new Promise<Array<{ timestamp: number; price: number }>>((_, rej) => setTimeout(() => rej(new Error("Spot timeout")), 20000)),
+      ]).catch(() => [] as Array<{ timestamp: number; price: number }>),
+      Promise.race([
+        binanceSpot.fetchPrices(market.binanceSymbol, startTime, endTime),
+        new Promise<Array<{ timestamp: number; price: number }>>((_, rej) => setTimeout(() => rej(new Error("Binance timeout")), 20000)),
+      ]).catch(() => [] as Array<{ timestamp: number; price: number }>),
     ]);
 
     if (ratesA.length === 0) {
       console.error(`  ${market.hlCoin}: no HL funding data`);
       return null;
     }
-    if (prices.length === 0) {
-      console.error(`  ${market.hlCoin}: no Binance price data`);
+    if (pricesHL.length === 0 && pricesBinance.length === 0) {
+      console.error(`  ${market.hlCoin}: no price data from either exchange`);
       return null;
     }
 
     // Create synthetic spot funding (0 for all)
     const ratesB = ratesA.map((r) => ({ ...r, fundingRate: 0, coin: "spot" }));
+
+    // Use Binance prices as primary for HL leg (closest perp venue match),
+    // Uniswap prices for the Binance leg (or vice versa)
+    const priceDataA = pricesBinance.length > 0 ? pricesBinance : pricesHL;
+    const priceDataB = pricesHL.length > 0 ? pricesHL : pricesBinance;
 
     const config: Partial<BacktestConfig> = {
       initialCapital: capital,
@@ -91,6 +106,8 @@ async function runSingleBacktest(market: MarketConfig, days: number, capital: nu
       maxPositionSize: capital * 0.5,
       venueA: "binance",
       venueB: "hyperliquid",
+      priceDataA,
+      priceDataB,
     };
 
     const result = runBacktest(ratesA, ratesB, config);
@@ -323,7 +340,9 @@ async function main() {
     console.log(`  Net PnL:     $${best.netPnl.toFixed(2)}`);
     console.log(`  Total Fees:  $${best.totalFees.toFixed(2)}`);
     console.log(`  Funding:     $${(best.result.totalFundingCollected - best.result.totalFundingPaid).toFixed(2)}`);
-    console.log(`  Trades:      ${best.result.totalTrades}`);
+    console.log(`  Price Spread PnL: $${best.result.totalPriceSpreadPnl.toFixed(2)}`);
+    console.log(`  Avg Price Spread: ${best.result.avgPriceSpreadBps.toFixed(1)} bps | Max: ${best.result.maxPriceSpreadBps.toFixed(1)} bps`);
+    console.log(`  Trades:      ${best.result.totalTrades} (skipped ${best.result.skippedDueToPriceSpread} due to price spread)`);
     console.log(`  Win Rate:    ${(best.result.winRate * 100).toFixed(1)}%`);
     console.log(`  Max DD:      ${best.maxDrawdownPct.toFixed(2)}%`);
     console.log(`  Breakeven:   ${bestBeStr}`);
@@ -337,7 +356,7 @@ async function main() {
     if (best.result.trades.length > 0) {
       console.log();
       console.log("  TRADE BREAKDOWN");
-      console.log("  " + "-".repeat(112));
+      console.log("  " + "-".repeat(128));
       console.log(
         "  " +
         "#".padStart(3) +
@@ -348,6 +367,7 @@ async function main() {
         "PnL".padStart(10) +
         "Fees".padStart(9) +
         "Funding".padStart(10) +
+        "PriceSprd".padStart(10) +
         "  " +
         "Expected".padStart(10) +
         "Actual".padStart(10) +
@@ -355,7 +375,7 @@ async function main() {
         "Diff".padEnd(12) +
         "Liquidated".padEnd(14)
       );
-      console.log("  " + "-".repeat(112));
+      console.log("  " + "-".repeat(128));
 
       for (let i = 0; i < best.result.trades.length; i++) {
         const t = best.result.trades[i];
@@ -397,6 +417,7 @@ async function main() {
         const feesStr = `$${t.feesPaid.toFixed(0)}`;
         const fundingNet = t.fundingCollected - t.fundingPaid;
         const fundingStr = `$${fundingNet.toFixed(0)}`;
+        const priceSprdStr = `$${t.priceSpreadPnl.toFixed(0)}`;
         const liqStr = t.liquidated
           ? `Leg ${t.liquidatedLeg}! -$${t.liquidationLoss.toFixed(0)}`
           : "no";
@@ -407,14 +428,15 @@ async function main() {
           `${durationStr.padStart(10)}  ` +
           `${pnlStr.padStart(10)}` +
           `${feesStr.padStart(9)}` +
-          `${fundingStr.padStart(10)}  ` +
+          `${fundingStr.padStart(10)}` +
+          `${priceSprdStr.padStart(10)}  ` +
           `${expStr.padStart(10)}` +
           `${actStr.padStart(10)}  ` +
           `${diffStr.padEnd(12)}` +
           `${liqStr.padEnd(14)}`
         );
       }
-      console.log("  " + "-".repeat(112));
+      console.log("  " + "-".repeat(128));
     }
 
     // Crossover analysis: was another combo better at any point?

@@ -255,11 +255,43 @@ async function fetchVenuePrices(
   startTime: number,
   endTime: number
 ): Promise<Array<{ timestamp: number; price: number }>> {
+  // Try to find a matching spot exchange for this venue
   const spot = getSpotExchange(venueId);
   if (spot) {
     const symbol = coin.endsWith("USDT") ? coin : `${coin}USDT`;
-    return spot.fetchPrices(symbol, startTime, endTime);
+    try {
+      return await Promise.race([
+        spot.fetchPrices(symbol, startTime, endTime),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("price timeout")), 30000)),
+      ]);
+    } catch {
+      return [];
+    }
   }
+
+  // For perp-only venues (hyperliquid, lighter, etc.), try to find a corresponding spot exchange
+  const perpToSpot: Record<string, string> = {
+    "binance-perp": "binance",
+    "bybit": "bybit-spot",
+    "okx": "okx-spot",
+    "mexc": "mexc-spot",
+  };
+  const spotId = perpToSpot[venueId];
+  if (spotId) {
+    const fallbackSpot = getSpotExchange(spotId);
+    if (fallbackSpot) {
+      const symbol = coin.endsWith("USDT") ? coin : `${coin}USDT`;
+      try {
+        return await Promise.race([
+          fallbackSpot.fetchPrices(symbol, startTime, endTime),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("price timeout")), 30000)),
+        ]);
+      } catch {
+        return [];
+      }
+    }
+  }
+
   return [];
 }
 
@@ -275,19 +307,24 @@ export async function optimizeCoin(
   const startTime = endTime - days * 24 * 60 * 60 * 1000;
 
   const fundingCache = new Map<string, FundingRateEntry[]>();
+  const priceCache = new Map<string, Array<{ timestamp: number; price: number }>>();
   const perpVenueIds = new Set<string>();
-  const spotVenueIds = new Set<string>();
+  const allVenueIds = new Set<string>();
 
   for (const combo of combos) {
     if (combo.strategy === "spot_vs_perp") {
-      spotVenueIds.add(combo.perpA);
+      allVenueIds.add(combo.perpA); // spot venue
       perpVenueIds.add(combo.perpB);
+      allVenueIds.add(combo.perpB);
     } else {
       perpVenueIds.add(combo.perpA);
       perpVenueIds.add(combo.perpB);
+      allVenueIds.add(combo.perpA);
+      allVenueIds.add(combo.perpB);
     }
   }
 
+  // Fetch funding data for all perp venues
   for (const venueId of perpVenueIds) {
     const key = `perp_${venueId}`;
     if (!fundingCache.has(key)) {
@@ -300,14 +337,27 @@ export async function optimizeCoin(
     }
   }
 
-  // Fetch price data from Uniswap (DeFi Llama) for liquidation checks
-  let priceData: Array<{ timestamp: number; price: number }> = [];
+  // Fetch price data from each venue for inter-exchange price spread tracking
+  for (const venueId of allVenueIds) {
+    const key = `price_${venueId}`;
+    if (!priceCache.has(key)) {
+      try {
+        const data = await fetchVenuePrices(venueId, coin, startTime, endTime);
+        priceCache.set(key, data);
+      } catch {
+        priceCache.set(key, []);
+      }
+    }
+  }
+
+  // Fallback: fetch Uniswap (DeFi Llama) prices as a reference when venue-specific data is missing
+  let fallbackPriceData: Array<{ timestamp: number; price: number }> = [];
   try {
     const uni = new UniswapSpotExchange();
     const symbol = coin.endsWith("USDT") ? coin : `${coin}USDT`;
-    priceData = await uni.fetchPrices(symbol, startTime, endTime);
+    fallbackPriceData = await uni.fetchPrices(symbol, startTime, endTime);
   } catch {
-    priceData = [];
+    fallbackPriceData = [];
   }
 
   const results: OptimizationResult[] = [];
@@ -348,6 +398,26 @@ export async function optimizeCoin(
       let bestResult: OptimizationResult | null = null;
 
       for (const exitOnNeg of [false, true]) {
+        // Resolve per-exchange price data: use venue-specific data, falling back to Uniswap/DeFi Llama
+        let priceDataA: Array<{ timestamp: number; price: number }>;
+        let priceDataB: Array<{ timestamp: number; price: number }>;
+
+        if (combo.strategy === "spot_vs_perp") {
+          // Leg A = spot venue, Leg B = perp venue
+          priceDataA = priceCache.get(`price_${combo.perpA}`) || fallbackPriceData;
+          priceDataB = priceCache.get(`price_${combo.perpB}`) || fallbackPriceData;
+          // If spot venue has no data but perp venue does, use perp data for both
+          if (priceDataA.length === 0 && priceDataB.length > 0) priceDataA = priceDataB;
+          if (priceDataB.length === 0 && priceDataA.length > 0) priceDataB = priceDataA;
+        } else {
+          // Perp vs Perp: fetch from each perp venue's corresponding spot exchange
+          priceDataA = priceCache.get(`price_${combo.perpA}`) || fallbackPriceData;
+          priceDataB = priceCache.get(`price_${combo.perpB}`) || fallbackPriceData;
+          // If a perp venue has no spot price data, use fallback for that side
+          if (priceDataA.length === 0) priceDataA = fallbackPriceData;
+          if (priceDataB.length === 0) priceDataB = fallbackPriceData;
+        }
+
         const config: Partial<BacktestConfig> = {
           initialCapital: capital,
           strategy: combo.strategy,
@@ -362,7 +432,9 @@ export async function optimizeCoin(
           exitOnNegativeFunding: exitOnNeg,
           perpLeverageA: combo.strategy === "perp_vs_perp" ? 3 : 2,
           perpLeverageB: combo.strategy === "perp_vs_perp" ? 3 : 2,
-          priceData,
+          priceData: fallbackPriceData,
+          priceDataA,
+          priceDataB,
         };
 
         const result = runBacktest(ratesA, ratesB, config);

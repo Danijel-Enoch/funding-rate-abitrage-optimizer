@@ -5,7 +5,8 @@
  * 1. Spot vs Perp: Long spot + Short perp (or vice versa)
  * 2. Perp vs Perp: Long perp on Exchange A + Short perp on Exchange B (3x leverage)
  *
- * Includes realistic fee modeling (taker/maker) and bid-ask spread costs.
+ * Includes realistic fee modeling (taker/maker), bid-ask spread costs,
+ * and inter-exchange price spread tracking for basis risk measurement.
  */
 
 import type { FundingRateEntry } from "./exchanges/types";
@@ -62,8 +63,11 @@ export interface BacktestConfig {
   useMakerFees: boolean;       // use maker fees instead of taker
   exitOnNegativeFunding: boolean;  // close position when funding turns negative
   flip: FlipConfig;            // position flipping config
-  priceData: Array<{ timestamp: number; price: number }>; // hourly price data for liquidation checks
+  priceData: Array<{ timestamp: number; price: number }>; // legacy: single price source for liquidation checks
+  priceDataA: Array<{ timestamp: number; price: number }>; // price data from venue A
+  priceDataB: Array<{ timestamp: number; price: number }>; // price data from venue B
   maintenanceMarginBps: number; // maintenance margin in bps (e.g., 500 = 5%)
+  maxPriceSpreadBps: number;   // max inter-exchange price spread (bps) to enter a trade
 }
 
 export interface Trade {
@@ -85,7 +89,7 @@ export interface Trade {
   entryFundingRateB: number;
   exitFundingRateA?: number;
   exitFundingRateB?: number;
-  spreadBps: number;
+  spreadBps: number;           // funding rate spread at entry
   status: "open" | "closed";
   flipCount: number;            // number of times this position was flipped
   negativeFundingHours: number; // cumulative hours of negative funding during trade
@@ -93,6 +97,11 @@ export interface Trade {
   actualBreakevenHours: number;   // when PnL actually crossed 0 (-1 = never)
   entryPriceA: number;           // price at entry for leg A
   entryPriceB: number;           // price at entry for leg B
+  exitPriceA?: number;           // price at exit for leg A
+  exitPriceB?: number;           // price at exit for leg B
+  entryPriceSpreadBps: number;   // inter-exchange price spread at entry (bps)
+  exitPriceSpreadBps?: number;   // inter-exchange price spread at exit (bps)
+  priceSpreadPnl: number;        // PnL contribution from price divergence between exchanges
   liquidated: boolean;           // was this trade liquidated?
   liquidatedAt?: Date;           // when liquidation happened
   liquidatedLeg?: "A" | "B";    // which leg was liquidated
@@ -127,6 +136,7 @@ export interface BacktestResult {
   avgFundingRateB: number;
   avgSpreadBps: number;
   skippedDueToSpread: number;
+  skippedDueToPriceSpread: number; // trades skipped due to inter-exchange price spread
   totalFlips: number;           // total number of flips executed
   flipCostPaid: number;         // total fees paid from flipping
   avgNegativeFundingHours: number; // avg hours of negative funding per trade
@@ -136,18 +146,54 @@ export interface BacktestResult {
   timestamps: number[];         // timestamps aligned to pnlHistory
   liquidationEvents: LiquidationEvent[]; // any liquidation events during backtest
   totalLiquidationLoss: number; // total PnL lost to liquidations
+  // Price spread statistics
+  avgPriceSpreadBps: number;    // average inter-exchange price spread across the period
+  maxPriceSpreadBps: number;    // maximum inter-exchange price spread observed
+  totalPriceSpreadPnl: number;  // total PnL contribution from price divergence
+  priceSpreadHistory: number[]; // price spread (bps) at each aligned data point
 }
 
 interface AlignedData {
   timestamp: number;
   fundingRateA: number;
   fundingRateB: number;
-  spreadBps: number;
+  spreadBps: number;           // funding rate spread
+  priceA: number | null;       // price from venue A at this timestamp
+  priceB: number | null;       // price from venue B at this timestamp
+  priceSpreadBps: number | null; // inter-exchange price spread in bps (null if either price missing)
+}
+
+function buildPriceLookup(
+  prices: Array<{ timestamp: number; price: number }>
+): (ts: number) => number | null {
+  if (prices.length === 0) return () => null;
+  return (ts: number): number | null => {
+    let lo = 0, hi = prices.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (prices[mid].timestamp < ts) lo = mid + 1;
+      else hi = mid;
+    }
+    let best = lo;
+    if (lo > 0 && Math.abs(prices[lo - 1].timestamp - ts) < Math.abs(prices[lo].timestamp - ts)) {
+      best = lo - 1;
+    }
+    if (Math.abs(prices[best].timestamp - ts) > 2 * 3600 * 1000) return null;
+    return prices[best].price;
+  };
+}
+
+function calcPriceSpreadBps(priceA: number, priceB: number): number {
+  const avg = (priceA + priceB) / 2;
+  if (avg === 0) return 0;
+  return (Math.abs(priceA - priceB) / avg) * 10000;
 }
 
 function alignFundingData(
   ratesA: FundingRateEntry[],
-  ratesB: FundingRateEntry[]
+  ratesB: FundingRateEntry[],
+  lookupPriceA: (ts: number) => number | null,
+  lookupPriceB: (ts: number) => number | null,
 ): AlignedData[] {
   const mapB = new Map<number, number>();
   for (const r of ratesB) {
@@ -161,11 +207,20 @@ function alignFundingData(
     const rateB = mapB.get(key);
     if (rateB !== undefined) {
       const spreadBps = Math.abs(rA.fundingRate - rateB) * 10000;
+      const priceA = lookupPriceA(rA.timestamp);
+      const priceB = lookupPriceB(rA.timestamp);
+      let priceSpreadBps: number | null = null;
+      if (priceA !== null && priceB !== null && priceA > 0 && priceB > 0) {
+        priceSpreadBps = calcPriceSpreadBps(priceA, priceB);
+      }
       aligned.push({
         timestamp: rA.timestamp,
         fundingRateA: rA.fundingRate,
         fundingRateB: rateB,
         spreadBps,
+        priceA,
+        priceB,
+        priceSpreadBps,
       });
     }
   }
@@ -212,7 +267,10 @@ function getConfig(config: Partial<BacktestConfig>): BacktestConfig {
       flipCooldownHours: config.flip?.flipCooldownHours ?? 6,
     },
     priceData: config.priceData ?? [],
+    priceDataA: config.priceDataA ?? config.priceData ?? [],
+    priceDataB: config.priceDataB ?? config.priceData ?? [],
     maintenanceMarginBps: config.maintenanceMarginBps ?? 500, // 5% default
+    maxPriceSpreadBps: config.maxPriceSpreadBps ?? 500, // 5% default max price divergence
   };
 }
 
@@ -222,7 +280,14 @@ export function runBacktest(
   config: Partial<BacktestConfig> = {}
 ): BacktestResult {
   const cfg = getConfig(config);
-  const data = alignFundingData(ratesA, ratesB);
+
+  // Build per-exchange price lookups
+  const lookupPriceA = buildPriceLookup(cfg.priceDataA);
+  const lookupPriceB = buildPriceLookup(cfg.priceDataB);
+  // Legacy single-price fallback for liquidation checks when per-exchange data is missing
+  const lookupPriceFallback = buildPriceLookup(cfg.priceData);
+
+  const data = alignFundingData(ratesA, ratesB, lookupPriceA, lookupPriceB);
 
   // Pre-calculate fee costs per hour (approximate - in reality fees are per trade)
   const leverageA = cfg.perpLeverageA;
@@ -234,6 +299,7 @@ export function runBacktest(
   let cumulativePnl = 0;
   const pnlHistory: number[] = [0];
   let skippedDueToSpread = 0;
+  let skippedDueToPriceSpread = 0;
   let totalFees = 0;
   let totalFlips = 0;
   let flipCostPaid = 0;
@@ -246,28 +312,23 @@ export function runBacktest(
   let breakevenReached = false;
   const liquidationEvents: LiquidationEvent[] = [];
   let totalLiquidationLoss = 0;
+  let totalPriceSpreadPnl = 0;
+  let maxPriceSpreadBps = 0;
+  let priceSpreadSum = 0;
+  let priceSpreadCount = 0;
+  const priceSpreadHistory: number[] = [];
 
-  // Price lookup: find price closest to a timestamp (within 2 hours)
-  function findPrice(ts: number): number | null {
-    const prices = cfg.priceData;
-    if (prices.length === 0) return null;
-    let lo = 0, hi = prices.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (prices[mid].timestamp < ts) lo = mid + 1;
-      else hi = mid;
-    }
-    // Check lo and lo-1, pick closest
-    let best = lo;
-    if (lo > 0 && Math.abs(prices[lo - 1].timestamp - ts) < Math.abs(prices[lo].timestamp - ts)) {
-      best = lo - 1;
-    }
-    if (Math.abs(prices[best].timestamp - ts) > 2 * 3600 * 1000) return null; // >2 hours away
-    return prices[best].price;
+  // Helper: get price for a venue, falling back to legacy single price data
+  function getPrice(venue: "A" | "B", ts: number): number | null {
+    const specificLookup = venue === "A" ? lookupPriceA : lookupPriceB;
+    const price = specificLookup(ts);
+    if (price !== null) return price;
+    // Fallback to legacy single price data
+    return lookupPriceFallback(ts);
   }
 
   // Check if a leveraged position would be liquidated
-  // Returns { liquidated: boolean, loss: number, liqPrice: number }
+  // Uses per-exchange prices when available
   function checkLiquidation(
     entryPrice: number,
     currentPrice: number,
@@ -312,9 +373,47 @@ export function runBacktest(
     return (feeAEntry + feeBEntry) * 4 + spreadCost * 2;
   }
 
+  // Calculate price spread PnL contribution for a leg
+  // When long A and short B, price divergence PnL = notionalA * (priceA_now - priceA_entry)/priceA_entry - notionalB * (priceB_now - priceB_entry)/priceB_entry
+  function calcPriceSpreadPnl(
+    direction: "long_a_short_b" | "short_a_long_b",
+    notionalA: number, notionalB: number,
+    entryPriceA: number, entryPriceB: number,
+    currentPriceA: number, currentPriceB: number,
+  ): number {
+    if (entryPriceA <= 0 || entryPriceB <= 0 || currentPriceA <= 0 || currentPriceB <= 0) return 0;
+
+    let legAreturn: number;
+    let legBreturn: number;
+
+    if (direction === "long_a_short_b") {
+      // Long A: profit when priceA goes up
+      legAreturn = (currentPriceA - entryPriceA) / entryPriceA;
+      // Short B: profit when priceB goes down
+      legBreturn = (entryPriceB - currentPriceB) / entryPriceB;
+    } else {
+      // Short A: profit when priceA goes down
+      legAreturn = (entryPriceA - currentPriceA) / entryPriceA;
+      // Long B: profit when priceB goes up
+      legBreturn = (currentPriceB - entryPriceB) / entryPriceB;
+    }
+
+    return notionalA * legAreturn + notionalB * legBreturn;
+  }
+
   for (let i = 1; i < data.length; i++) {
     const cur = data[i];
     const prev = data[i - 1];
+
+    // Record price spread history
+    if (cur.priceSpreadBps !== null) {
+      priceSpreadHistory.push(cur.priceSpreadBps);
+      priceSpreadSum += cur.priceSpreadBps;
+      priceSpreadCount++;
+      if (cur.priceSpreadBps > maxPriceSpreadBps) {
+        maxPriceSpreadBps = cur.priceSpreadBps;
+      }
+    }
 
     // Record PnL at every data point (realized + unrealized) - must be before any continue
     const unrealizedPnlTop = openTrade ? openTrade.pnl : 0;
@@ -323,8 +422,8 @@ export function runBacktest(
     // Update open trade PnL
     if (openTrade) {
       // Funding differential PnL (leveraged notional)
-      const notionalA = openTrade.notionalA;
-      const notionalB = openTrade.notionalB;
+      const notionalA: number = openTrade.notionalA;
+      const notionalB: number = openTrade.notionalB;
       let fundingDiff: number;
       let currentFundingDiff: number;
 
@@ -342,6 +441,31 @@ export function runBacktest(
       openTrade.fundingPaid += Math.abs(Math.min(fundingDiff, 0));
       openTrade.pnl += fundingDiff;
 
+      // Price spread PnL: track unrealized gains/losses from price divergence
+      if (cur.priceA !== null && cur.priceB !== null && openTrade.entryPriceA > 0 && openTrade.entryPriceB > 0) {
+        const pricePnl = calcPriceSpreadPnl(
+          openTrade.direction,
+          notionalA, notionalB,
+          openTrade.entryPriceA, openTrade.entryPriceB,
+          cur.priceA, cur.priceB,
+        );
+        // The price PnL delta from last period
+        const prevCur = data[i - 1];
+        let prevPricePnl = 0;
+        if (prevCur.priceA !== null && prevCur.priceB !== null && openTrade.entryPriceA > 0 && openTrade.entryPriceB > 0) {
+          prevPricePnl = calcPriceSpreadPnl(
+            openTrade.direction,
+            notionalA, notionalB,
+            openTrade.entryPriceA, openTrade.entryPriceB,
+            prevCur.priceA, prevCur.priceB,
+          );
+        }
+        const pricePnlDelta = pricePnl - prevPricePnl;
+        openTrade.priceSpreadPnl += pricePnlDelta;
+        openTrade.pnl += pricePnlDelta;
+        totalPriceSpreadPnl += pricePnlDelta;
+      }
+
       // Track actual breakeven within this trade
       if (!tradeBreakevenReached) {
         tradeCumPnl += fundingDiff;
@@ -358,19 +482,16 @@ export function runBacktest(
         openTrade.negativeFundingHours++;
       }
 
-      // Liquidation check: get current price and check both legs
+      // Liquidation check: use per-exchange prices for each leg
       if (openTrade.entryPriceA > 0 && !openTrade.liquidated) {
-        const currentPrice = findPrice(cur.timestamp);
-        if (currentPrice && openTrade.entryPriceA > 0) {
-          // Check leg A (long_a_short_b means long A)
+        const currentPriceA = getPrice("A", cur.timestamp);
+        const currentPriceB = getPrice("B", cur.timestamp);
+
+        // Check leg A
+        if (currentPriceA !== null) {
           const isLongA = openTrade.direction === "long_a_short_b";
           const liqA = checkLiquidation(
-            openTrade.entryPriceA, currentPrice, leverageA, openTrade.notionalA, isLongA
-          );
-          // Check leg B (opposite direction)
-          const isLongB = !isLongA;
-          const liqB = checkLiquidation(
-            openTrade.entryPriceB, currentPrice, leverageB, openTrade.notionalB, isLongB
+            openTrade.entryPriceA, currentPriceA, leverageA, openTrade.notionalA, isLongA
           );
 
           if (liqA.liquidated) {
@@ -385,13 +506,23 @@ export function runBacktest(
               leg: "A",
               entryPrice: openTrade.entryPriceA,
               liquidationPrice: liqA.liqPrice,
-              priceMove: ((currentPrice - openTrade.entryPriceA) / openTrade.entryPriceA) * (isLongA ? -1 : 1) * 100,
+              priceMove: ((currentPriceA - openTrade.entryPriceA) / openTrade.entryPriceA) * (isLongA ? -1 : 1) * 100,
               leverage: leverageA,
               notional: openTrade.notionalA,
               loss: liqA.loss,
               strategy: `${cfg.venueA} vs ${cfg.venueB}`,
             });
-          } else if (liqB.liquidated) {
+          }
+        }
+
+        // Check leg B
+        if (currentPriceB !== null && !openTrade.liquidated) {
+          const isLongB = openTrade.direction !== "long_a_short_b";
+          const liqB = checkLiquidation(
+            openTrade.entryPriceB, currentPriceB, leverageB, openTrade.notionalB, isLongB
+          );
+
+          if (liqB.liquidated) {
             openTrade.liquidated = true;
             openTrade.liquidatedAt = new Date(cur.timestamp);
             openTrade.liquidatedLeg = "B";
@@ -403,7 +534,7 @@ export function runBacktest(
               leg: "B",
               entryPrice: openTrade.entryPriceB,
               liquidationPrice: liqB.liqPrice,
-              priceMove: ((currentPrice - openTrade.entryPriceB) / openTrade.entryPriceB) * (isLongB ? -1 : 1) * 100,
+              priceMove: ((currentPriceB - openTrade.entryPriceB) / openTrade.entryPriceB) * (isLongB ? -1 : 1) * 100,
               leverage: leverageB,
               notional: openTrade.notionalB,
               loss: liqB.loss,
@@ -440,6 +571,9 @@ export function runBacktest(
             openTrade.exitFundingRateA = cur.fundingRateA;
             openTrade.exitFundingRateB = cur.fundingRateB;
             openTrade.exitCostBps = calcFlipCostBps();
+            openTrade.exitPriceA = cur.priceA ?? 0;
+            openTrade.exitPriceB = cur.priceB ?? 0;
+            openTrade.exitPriceSpreadBps = cur.priceSpreadBps ?? 0;
             openTrade.feesPaid += totalExitCost;
             openTrade.pnl -= totalExitCost;
             openTrade.status = "closed";
@@ -447,11 +581,17 @@ export function runBacktest(
             totalFees += totalExitCost;
             flipCostPaid += totalExitCost;
 
+            const prevDirection: "long_a_short_b" | "short_a_long_b" = openTrade.direction;
+            const prevSize: number = openTrade.size;
+            const prevLevA: number = openTrade.leverageA;
+            const prevLevB: number = openTrade.leverageB;
+            const prevFlipCount: number = openTrade.flipCount;
+
             capital += openTrade.pnl;
             trades.push(openTrade);
 
             // Open flipped position immediately
-            const flippedDirection = openTrade.direction === "long_a_short_b"
+            const flippedDirection: "long_a_short_b" | "short_a_long_b" = prevDirection === "long_a_short_b"
               ? "short_a_long_b" : "long_a_short_b";
 
             const feeAEntryBps = cfg.useMakerFees ? cfg.feeA.makerFeeBps : cfg.feeA.takerFeeBps;
@@ -463,11 +603,11 @@ export function runBacktest(
             openTrade = {
               entryTime: new Date(cur.timestamp),
               direction: flippedDirection,
-              size: openTrade.size,
+              size: prevSize,
               notionalA,
               notionalB,
-              leverageA: openTrade.leverageA,
-              leverageB: openTrade.leverageB,
+              leverageA: prevLevA,
+              leverageB: prevLevB,
               fundingCollected: 0,
               fundingPaid: 0,
               feesPaid: totalEntryCost,
@@ -478,8 +618,16 @@ export function runBacktest(
               entryFundingRateB: cur.fundingRateB,
               spreadBps: cur.spreadBps,
               status: "open",
-              flipCount: openTrade.flipCount,
+              flipCount: prevFlipCount,
               negativeFundingHours: 0,
+              expectedBreakevenHours: 0,
+              actualBreakevenHours: -1,
+              entryPriceA: cur.priceA ?? 0,
+              entryPriceB: cur.priceB ?? 0,
+              entryPriceSpreadBps: cur.priceSpreadBps ?? 0,
+              priceSpreadPnl: 0,
+              liquidated: false,
+              liquidationLoss: 0,
             };
             totalFees += totalEntryCost;
             flipCostPaid += totalEntryCost;
@@ -502,6 +650,12 @@ export function runBacktest(
       if (absDiff < cfg.fundingThreshold) continue;
       if (cur.spreadBps > cfg.maxSpreadBps) {
         skippedDueToSpread++;
+        continue;
+      }
+
+      // Skip entry if inter-exchange price spread is too wide (basis risk)
+      if (cur.priceSpreadBps !== null && cur.priceSpreadBps > cfg.maxPriceSpreadBps) {
+        skippedDueToPriceSpread++;
         continue;
       }
 
@@ -559,8 +713,10 @@ export function runBacktest(
         negativeFundingHours: 0,
         expectedBreakevenHours,
         actualBreakevenHours: -1,
-        entryPriceA: findPrice(cur.timestamp) ?? 0,
-        entryPriceB: findPrice(cur.timestamp) ?? 0,
+        entryPriceA: cur.priceA ?? 0,
+        entryPriceB: cur.priceB ?? 0,
+        entryPriceSpreadBps: cur.priceSpreadBps ?? 0,
+        priceSpreadPnl: 0,
         liquidated: false,
         liquidationLoss: 0,
       };
@@ -594,6 +750,11 @@ export function runBacktest(
         }
       }
 
+      // Exit 3: price spread exceeds threshold (basis risk too high)
+      if (cur.priceSpreadBps !== null && cur.priceSpreadBps > cfg.maxPriceSpreadBps * 1.5 && !shouldExit) {
+        shouldExit = true;
+      }
+
       if (shouldExit) {
         // Calculate exit fees
         const feeAExitBps = (cfg.useMakerFees ? cfg.feeA.makerFeeBps : cfg.feeA.takerFeeBps);
@@ -608,6 +769,9 @@ export function runBacktest(
         openTrade.exitFundingRateA = cur.fundingRateA;
         openTrade.exitFundingRateB = cur.fundingRateB;
         openTrade.exitCostBps = totalExitCostBps;
+        openTrade.exitPriceA = cur.priceA ?? 0;
+        openTrade.exitPriceB = cur.priceB ?? 0;
+        openTrade.exitPriceSpreadBps = cur.priceSpreadBps ?? 0;
         openTrade.feesPaid += totalExitCost;
         openTrade.pnl -= totalExitCost;
         openTrade.actualBreakevenHours = actualBreakevenHours;
@@ -648,6 +812,9 @@ export function runBacktest(
     openTrade.exitTime = new Date(last.timestamp);
     openTrade.exitFundingRateA = last.fundingRateA;
     openTrade.exitFundingRateB = last.fundingRateB;
+    openTrade.exitPriceA = last.priceA ?? 0;
+    openTrade.exitPriceB = last.priceB ?? 0;
+    openTrade.exitPriceSpreadBps = last.priceSpreadBps ?? 0;
     openTrade.feesPaid += totalExitCost;
     openTrade.pnl -= totalExitCost;
     openTrade.actualBreakevenHours = actualBreakevenHours;
@@ -694,6 +861,7 @@ export function runBacktest(
   const avgFundingRateA = data.reduce((s, d) => s + d.fundingRateA, 0) / (data.length || 1);
   const avgFundingRateB = data.reduce((s, d) => s + d.fundingRateB, 0) / (data.length || 1);
   const avgSpreadBps = data.reduce((s, d) => s + d.spreadBps, 0) / (data.length || 1);
+  const avgPriceSpreadBps = priceSpreadCount > 0 ? priceSpreadSum / priceSpreadCount : 0;
 
   return {
     trades,
@@ -711,6 +879,7 @@ export function runBacktest(
     avgFundingRateB,
     avgSpreadBps,
     skippedDueToSpread,
+    skippedDueToPriceSpread,
     totalFlips,
     flipCostPaid,
     avgNegativeFundingHours: totalTrades > 0
@@ -724,5 +893,9 @@ export function runBacktest(
     timestamps: data.map((d) => d.timestamp),
     liquidationEvents,
     totalLiquidationLoss,
+    avgPriceSpreadBps,
+    maxPriceSpreadBps,
+    totalPriceSpreadPnl,
+    priceSpreadHistory,
   };
 }

@@ -38,6 +38,8 @@ export const EXCHANGE_FEES: Record<string, FeeModel> = {
   "bybit-spot":  { takerFeeBps: 10.0, makerFeeBps: 10.0, avgSpreadBps: 1.5 },
   "okx-spot":    { takerFeeBps: 10.0, makerFeeBps: 8.0, avgSpreadBps: 1.5 },
   "mexc-spot":   { takerFeeBps: 10.0, makerFeeBps: 10.0, avgSpreadBps: 2.0 },
+  "hyperliquid-spot": { takerFeeBps: 3.5, makerFeeBps: 1.0, avgSpreadBps: 2.0 },
+  "lighter-spot":     { takerFeeBps: 2.0, makerFeeBps: 0.0, avgSpreadBps: 3.0 },
 };
 
 export interface FlipConfig {

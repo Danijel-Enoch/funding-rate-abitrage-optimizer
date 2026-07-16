@@ -275,6 +275,8 @@ async function fetchVenuePrices(
     "bybit": "bybit-spot",
     "okx": "okx-spot",
     "mexc": "mexc-spot",
+    "hyperliquid": "hyperliquid-spot",
+    "lighter": "lighter-spot",
   };
   const spotId = perpToSpot[venueId];
   if (spotId) {

@@ -264,10 +264,10 @@ async function main() {
   if (MODE === "--optimize") {
     const coin = VENUE_A.toUpperCase();
     console.log("=".repeat(90));
-    console.log("  BACKTEST OPTIMIZATION");
-    console.log("  Tests all strategy/venue combos, ranks by PnL with minimal drawdown");
-    console.log("  Includes taker/maker fees and bid-ask spread costs");
-    console.log("  Perp vs Perp: 3x leverage on both sides");
+    console.log("  BACKTEST OPTIMIZATION (BasisOS Enhanced)");
+    console.log("  Tests all strategy/venue combos with risk-adjusted leverage");
+    console.log("  Includes rebalancing, objective function scoring, and RLmax per asset");
+    console.log("  Perp vs Perp: leverage scaled to asset volatility");
     console.log("=".repeat(90));
     console.log();
     console.log(`  Coin:    ${coin}`);
@@ -288,7 +288,7 @@ async function main() {
     }
 
     console.log();
-    console.log("=".repeat(98));
+    console.log("=".repeat(110));
     console.log(
       "  " +
       "#".padStart(3) +
@@ -300,11 +300,11 @@ async function main() {
       "Trades".padStart(7) +
       "Win%".padStart(6) +
       "MDD%".padStart(7) +
-      "Score".padStart(8) +
-      "Breach".padStart(8) +
+      "Obj.F".padStart(9) +
+      "Lvg".padEnd(12) +
       "Liq".padStart(6)
     );
-    console.log("-".repeat(104));
+    console.log("-".repeat(114));
 
     for (let i = 0; i < Math.min(results.length, 15); i++) {
       const r = results[i];
@@ -315,22 +315,18 @@ async function main() {
       const trades = `${r.result.totalTrades}`.padStart(7);
       const win = `${(r.result.winRate * 100).toFixed(0)}%`.padStart(6);
       const dd = `${r.maxDrawdownPct.toFixed(1)}%`.padStart(7);
-      const score = `${r.score.toFixed(0)}`.padStart(8);
+      const objF = `${r.objectiveResult.objective.toFixed(4)}`.padStart(9);
+      const lvg = `${r.leverageConfig.minLeverage}/${r.leverageConfig.targetLeverage}/${r.leverageConfig.maxLeverage}`.padEnd(12);
 
       const medal = i === 0 ? " <- BEST" : "";
-      const be = r.result.breakevenHours;
-      let beStr: string;
-      if (be < 0) beStr = "never";
-      else if (be < 24) beStr = `${be}h`;
-      else beStr = `${(be / 24).toFixed(1)}d`;
       const liqCount = r.result.liquidationEvents.length;
       const liqStr = liqCount > 0
         ? `${liqCount}!`.padStart(6)
         : "  -".padStart(6);
-      console.log(`  ${(i + 1 + ".").padStart(4)} ${strat.padEnd(14)}${pair}${pnl}${fees}${trades}${win}${dd}${score}${beStr.padStart(8)}${liqStr}${medal}`);
+      console.log(`  ${(i + 1 + ".").padStart(4)} ${strat.padEnd(14)}${pair}${pnl}${fees}${trades}${win}${dd}${objF}${lvg}${liqStr}${medal}`);
     }
 
-    console.log("-".repeat(104));
+    console.log("-".repeat(114));
 
     const best = results[0];
     const bestBe = best.result.breakevenHours;
@@ -341,10 +337,19 @@ async function main() {
 
     console.log();
     console.log(`  BEST: ${best.combo.label}`);
-    console.log(`  Strategy:    ${best.combo.strategy === "spot_vs_perp" ? "Spot vs Perp (2x perp)" : "Perp vs Perp (3x both)"}`);
+    console.log(`  Strategy:    ${best.combo.strategy === "spot_vs_perp" ? "Spot vs Perp" : "Perp vs Perp"}`);
+    console.log(`  Leverage:    ${best.leverageConfig.minLeverage}x min / ${best.leverageConfig.targetLeverage}x target / ${best.leverageConfig.maxLeverage}x max`);
+    if (best.riskLeverage) {
+      console.log(`  RLmax:       ${best.riskLeverage.rlmax.toFixed(1)}x (from Q99 5m: ${(best.riskLeverage.q99_5m * 100).toFixed(2)}%, Q99 15m: ${(best.riskLeverage.q99_15m * 100).toFixed(2)}%)`);
+    }
     console.log(`  Net PnL:     $${best.netPnl.toFixed(2)}`);
     console.log(`  Total Fees:  $${best.totalFees.toFixed(2)}`);
     console.log(`  Funding:     $${(best.result.totalFundingCollected - best.result.totalFundingPaid).toFixed(2)}`);
+    console.log(`  Rebalances:  ${best.result.totalRebalances}`);
+    console.log(`  Objective F: ${best.objectiveResult.objective.toFixed(6)} (α=${0.5}, β=${0.3})`);
+    console.log(`  Avg APY:     ${(best.objectiveResult.avgApy * 100).toFixed(2)}%`);
+    console.log(`  DDq5:        ${(best.objectiveResult.ddq5 * 100).toFixed(4)}%`);
+    console.log(`  Leverage Δ:  ${best.objectiveResult.leverageAsymmetry.toFixed(1)} (Δmax=${best.objectiveResult.deltaMax.toFixed(1)}, Δmin=${best.objectiveResult.deltaMin.toFixed(1)})`);
     console.log(`  Price Spread PnL: $${best.result.totalPriceSpreadPnl.toFixed(2)}`);
     console.log(`  Avg Price Spread: ${best.result.avgPriceSpreadBps.toFixed(1)} bps | Max: ${best.result.maxPriceSpreadBps.toFixed(1)} bps`);
     console.log(`  Trades:      ${best.result.totalTrades} (skipped ${best.result.skippedDueToPriceSpread} due to price spread)`);

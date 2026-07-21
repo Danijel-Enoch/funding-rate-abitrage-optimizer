@@ -174,12 +174,14 @@ bun run tui                          # Interactive terminal UI
 ### Spot vs Perp
 - Long spot + Short perp (collect funding when perp premium)
 - Short spot + Long perp (collect funding when perp discount)
-- 2x leverage on perp leg
+- Dynamic leverage: target 2-3x based on RLmax (risk-adjusted leverage)
+- Automatic rebalancing when leverage drifts outside bounds
 
 ### Perp vs Perp
 - Long perp on Exchange A + Short perp on Exchange B
 - Profit from funding rate differential between venues
-- 3x leverage on both legs
+- Dynamic leverage: target 2-3x based on RLmax
+- Automatic rebalancing when leverage drifts outside bounds
 
 ### Tokenized Stock Basis (Stock Basket)
 - Long tokenized stock on BSC DEX (Uniswap/PancakeSwap) + Short stock perp on Hyperliquid HIP-3 or Lighter
@@ -216,6 +218,16 @@ bun run tui                          # Interactive terminal UI
 | Win% | Win rate |
 | Liq | Liquidation events (if any) |
 
+### BasisOS Metrics (basket / optimize)
+
+| Column | Description |
+|--------|-------------|
+| Obj.F | Objective function `F = A / ((1-α·DDq5)(1-β·Δ))` — higher = better |
+| DDq5 | 5% quantile max drawdown — tail risk measure |
+| Leverage Asym | Leverage asymmetry (0 = perfectly balanced) |
+| RLmax | Risk-adjusted max leverage from candlestick volatility |
+| Rebal | Number of rebalance events during backtest |
+
 ### Stock Basket Output
 
 | Section | Description |
@@ -239,6 +251,34 @@ bun run tui                          # Interactive terminal UI
 - **Infra**: LINK, The Graph, Chainlink, MultiversX, etc.
 - **RWA**: Ondo, Mantra, Polymesh, etc.
 - **GameFi**: Immutable, Gala, Beam, etc.
+
+## BasisOS Integration
+
+The backtester implements the BasisOS whitepaper's key concepts:
+
+### Risk-Adjusted Leverage (RLmax)
+- Computes maximum safe leverage from candlestick price data (5m/15m bars)
+- Formula: `RLmax = 1 / (maintenanceMargin + effectiveVol)`
+- Typical values: BTC ~13x, ETH ~13x, PEPE ~7.5x
+- Leverage configs are auto-generated from RLmax for each coin
+
+### Objective Function
+- `F = A / ((1-α·DDq5)(1-β·Δ))`
+- `A`: average APY
+- `DDq5`: 5% quantile max drawdown (tail risk)
+- `Δ`: leverage asymmetry between legs
+- `α=0.5, β=0.3`: tunable penalty weights
+- Higher F = better risk-adjusted returns
+
+### Rebalancing Algorithm
+- Targets a specific leverage (e.g., 2x)
+- Rebalances when leverage drifts outside `[Lmin, Lmax]` or allocation deviates > 15%
+- Tracks rebalance count per position
+
+### OI-Weighted Funding
+- `AFRI`: simple average funding rate across venues
+- `WFRI`: open-interest weighted funding rate
+- Ready for multi-venue capital allocation
 
 ### Tokenized Stocks (23)
 

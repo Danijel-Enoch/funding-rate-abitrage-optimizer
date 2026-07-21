@@ -6,11 +6,21 @@
  *
  * Includes realistic fees (taker/maker) and bid-ask spread costs.
  * Perp vs Perp uses 3x leverage on both sides.
+ *
+ * BasisOS enhancements:
+ * - Risk-adjusted leverage (RLmax) per asset
+ * - Rebalancing with target leverage
+ * - Objective function: F = Ā / ((1 - α·DDq5)(1 - β·Δ))
  */
 
 import { perpExchanges, spotExchanges, getPerpExchange, getSpotExchange } from "./exchanges";
 import { UniswapSpotExchange } from "./exchanges/uniswap";
-import { runBacktest, EXCHANGE_FEES, type BacktestConfig, type BacktestResult, type FeeModel } from "./backtest";
+import {
+  runBacktest, EXCHANGE_FEES,
+  calcRiskAdjustedLeverage, calcObjectiveFunction,
+  type BacktestConfig, type BacktestResult, type FeeModel,
+  type RebalanceConfig, type RiskAdjustedLeverage, type ObjectiveFunctionResult,
+} from "./backtest";
 import type { FundingRateEntry } from "./exchanges/types";
 import { TRADITIONAL_MARKETS } from "./markets";
 
@@ -31,6 +41,11 @@ export interface OptimizationResult {
   maxDrawdownPct: number;
   score: number;           // composite score: PnL - (drawdown penalty)
   exitOnNegative: boolean; // whether this uses exit-on-negative-funding mode
+  // BasisOS: objective function and leverage
+  objectiveResult: ObjectiveFunctionResult;
+  leverageConfig: { minLeverage: number; targetLeverage: number; maxLeverage: number };
+  riskLeverage: RiskAdjustedLeverage | null;
+  rebalanceEnabled: boolean;
 }
 
 export interface CrossoverPeriod {
@@ -183,10 +198,19 @@ export function analyzeCrossovers(
   };
 }
 
-// Score = PnL - (max drawdown * penalty factor)
-// We want high PnL AND low drawdown
-function calcScore(pnl: number, maxDrawdownPct: number): number {
-  const ddPenalty = maxDrawdownPct * 1000; // 1% DD = $1000 penalty on $50k
+// BasisOS: Score using objective function F = Ā / ((1 - α·DDq5)(1 - β·Δ))
+// Falls back to simple PnL - drawdown penalty when objective function isn't available
+function calcScore(
+  pnl: number,
+  maxDrawdownPct: number,
+  objectiveResult?: ObjectiveFunctionResult,
+): number {
+  if (objectiveResult && objectiveResult.objective > 0) {
+    // Use BasisOS objective function, scaled to be comparable with old scores
+    return objectiveResult.objective * 10000;
+  }
+  // Fallback: PnL - drawdown penalty
+  const ddPenalty = maxDrawdownPct * 1000;
   return pnl - ddPenalty;
 }
 
@@ -304,7 +328,7 @@ export async function optimizeCoin(
   onProgress?: (current: number, total: number, combo: VenueCombo) => void
 ): Promise<OptimizationResult[]> {
   const isTraditional = isTraditionalAsset(coin);
-  const combos = getAllCombos(isTraditional); // For traditional, only perp_vs_perp
+  const combos = getAllCombos(isTraditional);
   const endTime = Date.now();
   const startTime = endTime - days * 24 * 60 * 60 * 1000;
 
@@ -315,7 +339,7 @@ export async function optimizeCoin(
 
   for (const combo of combos) {
     if (combo.strategy === "spot_vs_perp") {
-      allVenueIds.add(combo.perpA); // spot venue
+      allVenueIds.add(combo.perpA);
       perpVenueIds.add(combo.perpB);
       allVenueIds.add(combo.perpB);
     } else {
@@ -339,7 +363,7 @@ export async function optimizeCoin(
     }
   }
 
-  // Fetch price data from each venue for inter-exchange price spread tracking
+  // Fetch price data from each venue
   for (const venueId of allVenueIds) {
     const key = `price_${venueId}`;
     if (!priceCache.has(key)) {
@@ -352,7 +376,7 @@ export async function optimizeCoin(
     }
   }
 
-  // Fallback: fetch Uniswap (DeFi Llama) prices as a reference when venue-specific data is missing
+  // Fallback: fetch Uniswap (DeFi Llama) prices
   let fallbackPriceData: Array<{ timestamp: number; price: number }> = [];
   try {
     const uni = new UniswapSpotExchange();
@@ -362,11 +386,52 @@ export async function optimizeCoin(
     fallbackPriceData = [];
   }
 
+  // ── BasisOS: Compute risk-adjusted leverage (RLmax) from price data ──
+  const bestPriceData = fallbackPriceData.length > 0
+    ? fallbackPriceData
+    : Array.from(priceCache.values()).find(p => p.length > 50) ?? [];
+
+  const riskLeverage = bestPriceData.length > 30
+    ? calcRiskAdjustedLeverage(bestPriceData, 5, 2, 0.05)
+    : null;
+
+  // Generate leverage configurations to test based on RLmax
+  const leverageConfigs: Array<{ minLeverage: number; targetLeverage: number; maxLeverage: number }> = [];
+  if (riskLeverage && riskLeverage.rlmax > 1) {
+    const rlmax = riskLeverage.rlmax;
+    // Test several configurations within the safe range
+    for (let target = 2; target <= Math.min(rlmax, 8); target++) {
+      const min = Math.max(1, target - 2);
+      const max = Math.min(rlmax, target + 3);
+      leverageConfigs.push({ minLeverage: min, targetLeverage: target, maxLeverage: max });
+    }
+    // Also test the "optimal" config (target at midpoint of safe range)
+    const midTarget = Math.round(rlmax * 0.5);
+    if (!leverageConfigs.some(c => c.targetLeverage === midTarget)) {
+      leverageConfigs.push({
+        minLeverage: Math.max(1, midTarget - 2),
+        targetLeverage: midTarget,
+        maxLeverage: Math.min(rlmax, midTarget + 3),
+      });
+    }
+  } else {
+    // Fallback: test standard configurations
+    leverageConfigs.push(
+      { minLeverage: 1, targetLeverage: 2, maxLeverage: 4 },
+      { minLeverage: 1, targetLeverage: 3, maxLeverage: 5 },
+      { minLeverage: 2, targetLeverage: 4, maxLeverage: 6 },
+    );
+  }
+
   const results: OptimizationResult[] = [];
+
+  // Total iterations: combos × leverageConfigs × exitModes
+  const exitModes = [false, true];
+  const totalIterations = combos.length * leverageConfigs.length * exitModes.length;
+  let iteration = 0;
 
   for (let i = 0; i < combos.length; i++) {
     const combo = combos[i];
-    onProgress?.(i + 1, combos.length, combo);
 
     try {
       let ratesA: FundingRateEntry[];
@@ -395,67 +460,93 @@ export async function optimizeCoin(
         feeB = EXCHANGE_FEES[combo.perpB] ?? EXCHANGE_FEES.aster;
       }
 
-      // Test both modes: hold through negative AND exit on negative
-      // Pick whichever gives better PnL for this combo
+      // Resolve price data
+      let priceDataA: Array<{ timestamp: number; price: number }>;
+      let priceDataB: Array<{ timestamp: number; price: number }>;
+
+      if (combo.strategy === "spot_vs_perp") {
+        priceDataA = priceCache.get(`price_${combo.perpA}`) || fallbackPriceData;
+        priceDataB = priceCache.get(`price_${combo.perpB}`) || fallbackPriceData;
+        if (priceDataA.length === 0 && priceDataB.length > 0) priceDataA = priceDataB;
+        if (priceDataB.length === 0 && priceDataA.length > 0) priceDataB = priceDataA;
+      } else {
+        priceDataA = priceCache.get(`price_${combo.perpA}`) || fallbackPriceData;
+        priceDataB = priceCache.get(`price_${combo.perpB}`) || fallbackPriceData;
+        if (priceDataA.length === 0) priceDataA = fallbackPriceData;
+        if (priceDataB.length === 0) priceDataB = fallbackPriceData;
+      }
+
       let bestResult: OptimizationResult | null = null;
 
-      for (const exitOnNeg of [false, true]) {
-        // Resolve per-exchange price data: use venue-specific data, falling back to Uniswap/DeFi Llama
-        let priceDataA: Array<{ timestamp: number; price: number }>;
-        let priceDataB: Array<{ timestamp: number; price: number }>;
+      // Test each leverage config × exit mode
+      for (const levCfg of leverageConfigs) {
+        for (const exitOnNeg of exitModes) {
+          iteration++;
+          if (iteration % 10 === 0) {
+            onProgress?.(iteration, totalIterations, combo);
+          }
 
-        if (combo.strategy === "spot_vs_perp") {
-          // Leg A = spot venue, Leg B = perp venue
-          priceDataA = priceCache.get(`price_${combo.perpA}`) || fallbackPriceData;
-          priceDataB = priceCache.get(`price_${combo.perpB}`) || fallbackPriceData;
-          // If spot venue has no data but perp venue does, use perp data for both
-          if (priceDataA.length === 0 && priceDataB.length > 0) priceDataA = priceDataB;
-          if (priceDataB.length === 0 && priceDataA.length > 0) priceDataB = priceDataA;
-        } else {
-          // Perp vs Perp: fetch from each perp venue's corresponding spot exchange
-          priceDataA = priceCache.get(`price_${combo.perpA}`) || fallbackPriceData;
-          priceDataB = priceCache.get(`price_${combo.perpB}`) || fallbackPriceData;
-          // If a perp venue has no spot price data, use fallback for that side
-          if (priceDataA.length === 0) priceDataA = fallbackPriceData;
-          if (priceDataB.length === 0) priceDataB = fallbackPriceData;
-        }
+          const rebalance: RebalanceConfig = {
+            enabled: true,
+            minLeverage: levCfg.minLeverage,
+            targetLeverage: levCfg.targetLeverage,
+            maxLeverage: levCfg.maxLeverage,
+            deviationThreshold: 0.15,
+          };
 
-        const config: Partial<BacktestConfig> = {
-          initialCapital: capital,
-          strategy: combo.strategy,
-          fundingThreshold: 0.00001,
-          maxSpreadBps: 100,
-          maxPositionSize: capital * 0.5,
-          venueA: combo.perpA,
-          venueB: combo.perpB,
-          feeA,
-          feeB,
-          useMakerFees: false,
-          exitOnNegativeFunding: exitOnNeg,
-          perpLeverageA: combo.strategy === "perp_vs_perp" ? 3 : 2,
-          perpLeverageB: combo.strategy === "perp_vs_perp" ? 3 : 2,
-          priceData: fallbackPriceData,
-          priceDataA,
-          priceDataB,
-        };
+          const config: Partial<BacktestConfig> = {
+            initialCapital: capital,
+            strategy: combo.strategy,
+            fundingThreshold: 0.00001,
+            maxSpreadBps: 100,
+            maxPositionSize: capital * 0.5,
+            venueA: combo.perpA,
+            venueB: combo.perpB,
+            feeA,
+            feeB,
+            useMakerFees: false,
+            exitOnNegativeFunding: exitOnNeg,
+            perpLeverageA: combo.strategy === "perp_vs_perp" ? levCfg.targetLeverage : 1,
+            perpLeverageB: combo.strategy === "perp_vs_perp" ? levCfg.targetLeverage : levCfg.targetLeverage,
+            priceData: fallbackPriceData,
+            priceDataA,
+            priceDataB,
+            rebalance,
+            coin,
+          };
 
-        const result = runBacktest(ratesA, ratesB, config);
-        const netPnl = result.totalPnl;
-        const score = calcScore(netPnl, result.maxDrawdownPct);
+          const result = runBacktest(ratesA, ratesB, config);
+          const netPnl = result.totalPnl;
 
-        const entry: OptimizationResult = {
-          combo,
-          result,
-          netPnl,
-          totalFees: result.totalFees,
-          apy: result.annualizedReturn * 100,
-          maxDrawdownPct: result.maxDrawdownPct * 100,
-          score,
-          exitOnNegative: exitOnNeg,
-        };
+          // Compute objective function
+          const objectiveResult = calcObjectiveFunction(
+            result.pnlHistory,
+            result.timestamps,
+            capital,
+            levCfg,
+            { alpha: 0.5, beta: 0.3 },
+          );
 
-        if (!bestResult || entry.score > bestResult.score) {
-          bestResult = entry;
+          const score = calcScore(netPnl, result.maxDrawdownPct, objectiveResult);
+
+          const entry: OptimizationResult = {
+            combo,
+            result,
+            netPnl,
+            totalFees: result.totalFees,
+            apy: result.annualizedReturn * 100,
+            maxDrawdownPct: result.maxDrawdownPct * 100,
+            score,
+            exitOnNegative: exitOnNeg,
+            objectiveResult,
+            leverageConfig: levCfg,
+            riskLeverage,
+            rebalanceEnabled: true,
+          };
+
+          if (!bestResult || entry.score > bestResult.score) {
+            bestResult = entry;
+          }
         }
       }
 
@@ -465,7 +556,7 @@ export async function optimizeCoin(
     }
   }
 
-  // Sort by composite score (PnL - drawdown penalty)
+  // Sort by objective function score
   results.sort((a, b) => b.score - a.score);
 
   return results;
@@ -595,6 +686,7 @@ export async function optimizeMultiPerp(
       priceDataB: priceCache.get(venueId) || spotPriceData,
     };
     const result = runBacktest(ratesA, ratesB, config);
+    const objResult = calcObjectiveFunction(result.pnlHistory, result.timestamps, capital, { minLeverage: 1, targetLeverage: 3, maxLeverage: 5 });
     singleResults.push({
       combo: { strategy: "spot_vs_perp", spotId: "uniswap", perpA: "uniswap", perpB: venueId, label: `Spot vs ${getPerpExchange(venueId)?.info.name ?? venueId}` },
       result,
@@ -602,8 +694,12 @@ export async function optimizeMultiPerp(
       totalFees: result.totalFees,
       apy: result.annualizedReturn * 100,
       maxDrawdownPct: result.maxDrawdownPct * 100,
-      score: calcScore(result.totalPnl, result.maxDrawdownPct),
+      score: calcScore(result.totalPnl, result.maxDrawdownPct, objResult),
       exitOnNegative: false,
+      objectiveResult: objResult,
+      leverageConfig: { minLeverage: 1, targetLeverage: 3, maxLeverage: 5 },
+      riskLeverage: null,
+      rebalanceEnabled: false,
     });
   }
 

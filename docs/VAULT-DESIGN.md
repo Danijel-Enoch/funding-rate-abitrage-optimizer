@@ -79,9 +79,16 @@ const stableVaultConfig = {
   maxSpreadBps: 50,
   maxPositionSize: capital * 0.3,  // 30% per position
   exitOnNegativeFunding: false,    // Hold through short negative periods
-  rebalanceThreshold: 0.0001,      // Rebalance when rate drifts 0.01%
   feeReservePct: 0.05,             // 5% reserve for fees
   maxDrawdownPct: 0.03,            // 3% max drawdown before de-risk
+  // BasisOS: risk-adjusted leverage
+  rebalance: {
+    enabled: true,
+    minLeverage: 1,
+    targetLeverage: 2,
+    maxLeverage: 4,         // Based on RLmax for stocks (~4x)
+    deviationThreshold: 0.15,
+  },
 };
 ```
 
@@ -118,9 +125,20 @@ const yellowVaultConfig = {
   maxSpreadBps: 100,
   maxPositionSize: capital * 0.4,
   exitOnNegativeFunding: false,
-  rebalanceThreshold: 0.0002,
   feeReservePct: 0.05,
   maxDrawdownPct: 0.05,      // 5% max drawdown
+  // BasisOS: risk-adjusted leverage
+  rebalance: {
+    enabled: true,
+    minLeverage: 1,
+    targetLeverage: 3,
+    maxLeverage: 6,          // Based on RLmax for BTC/ETH (~13x) but conservative
+    deviationThreshold: 0.15,
+  },
+  objectiveFunction: {
+    alpha: 0.5,
+    beta: 0.3,
+  },
   // Multi-coin allocation
   allocation: {
     BTC: 0.35,  // 35% of vault
@@ -165,9 +183,20 @@ const memeVaultConfig = {
   maxSpreadBps: 200,
   maxPositionSize: capital * 0.2,  // Smaller positions
   exitOnNegativeFunding: true,     // Exit quickly on negative
-  rebalanceThreshold: 0.0005,
   feeReservePct: 0.10,             // 10% reserve (higher fees)
   maxDrawdownPct: 0.10,            // 10% max drawdown
+  // BasisOS: risk-adjusted leverage for volatile assets
+  rebalance: {
+    enabled: true,
+    minLeverage: 1,
+    targetLeverage: 2,
+    maxLeverage: 4,              // RLmax for memes ~7.5x, keep conservative
+    deviationThreshold: 0.15,
+  },
+  objectiveFunction: {
+    alpha: 0.5,
+    beta: 0.3,
+  },
   allocation: {
     TRUMP: 0.40,
     PEPE: 0.35,
@@ -603,7 +632,66 @@ if (!correlationHealth.isHealthy) {
 
 ---
 
-## 7. Implementation Roadmap
+## 7. BasisOS Risk Framework
+
+### Risk-Adjusted Leverage (RLmax)
+
+Compute maximum safe leverage from price history:
+
+```typescript
+// RLmax = 1 / (maintenanceMargin + effectiveVol)
+// effectiveVol = max(Q99(5m_range), Q99(15m_change))
+
+const riskLeverage = calcRiskAdjustedLeverage(priceData, 5, 2, 0.05);
+// riskLeverage.rlmax ≈ 13x for BTC, 7.5x for PEPE
+```
+
+Typical RLmax values:
+| Asset | RLmax | Safe Target | Notes |
+|-------|-------|-------------|-------|
+| BTC | ~13x | 2-3x | Most liquid, lowest vol |
+| ETH | ~13x | 2-3x | High liquidity |
+| SOL | ~13x | 2-3x | High liquidity |
+| PEPE | ~7.5x | 1-2x | High volatility |
+| DOGE | ~12x | 2-3x | Medium volatility |
+
+### Objective Function
+
+Score positions by `F = A / ((1-α·DDq5)(1-β·Δ))`:
+
+```typescript
+const obj = calcObjectiveFunction(pnlHistory, timestamps, capital, leverageConfig);
+// obj.objective: higher = better risk-adjusted returns
+// obj.ddq5: 5% quantile drawdown (tail risk)
+// obj.leverageAsymmetry: imbalance between legs (0 = balanced)
+```
+
+Use objective function instead of raw PnL for ranking. This penalizes:
+- **High drawdown** (DDq5 > 0)
+- **Leverage imbalance** (Δmax ≠ Δmin)
+
+### Rebalancing
+
+Maintain target leverage automatically:
+
+```typescript
+rebalance: {
+  enabled: true,
+  minLeverage: 1,        // min before adding
+  targetLeverage: 3,     // target leverage
+  maxLeverage: 6,        // max before reducing
+  deviationThreshold: 0.15,  // 15% allocation deviation triggers
+}
+```
+
+Rebalance triggers:
+1. Current leverage < minLeverage → add size
+2. Current leverage > maxLeverage → reduce size
+3. Hedge allocation deviates > ε from target → rebalance
+
+---
+
+## 8. Implementation Roadmap
 
 ### Phase 1: Basic Vault (Week 1-2)
 - [ ] Single asset vault (ETH only)

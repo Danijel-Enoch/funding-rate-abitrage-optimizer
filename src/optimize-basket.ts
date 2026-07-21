@@ -22,7 +22,12 @@
 
 import { perpExchanges, spotExchanges, getPerpExchange, getSpotExchange } from "./exchanges";
 import { UniswapSpotExchange } from "./exchanges/uniswap";
-import { runBacktest, EXCHANGE_FEES, type BacktestConfig, type BacktestResult, type FeeModel } from "./backtest";
+import {
+  runBacktest, EXCHANGE_FEES,
+  calcRiskAdjustedLeverage, calcObjectiveFunction,
+  type BacktestConfig, type BacktestResult, type FeeModel,
+  type RebalanceConfig, type RiskAdjustedLeverage, type ObjectiveFunctionResult,
+} from "./backtest";
 import { MARKETS, getMarketsByCategory, type MarketConfig } from "./markets";
 import type { FundingRateEntry } from "./exchanges/types";
 
@@ -90,6 +95,11 @@ interface VenuePairResult {
   sharpeRatio: number;
   liquidations: number;
   exitOnNegative: boolean;
+  // BasisOS
+  objectiveResult: ObjectiveFunctionResult;
+  leverageConfig: { minLeverage: number; targetLeverage: number; maxLeverage: number };
+  riskLeverage: RiskAdjustedLeverage | null;
+  rebalances: number;
 }
 
 interface AggregatedVenuePair {
@@ -111,6 +121,11 @@ interface AggregatedVenuePair {
   totalLiquidations: number;
   exitOnNegative: boolean;
   coinBreakdown: VenuePairResult[];
+  // BasisOS
+  avgObjectiveF: number;
+  avgDDq5: number;
+  avgLeverageAsym: number;
+  totalRebalances: number;
 }
 
 // ── Data Fetching ──
@@ -206,59 +221,111 @@ function backtestCoinOnPair(
     feeB = EXCHANGE_FEES[pair.venueB] ?? EXCHANGE_FEES.aster;
   }
 
+  // Compute RLmax from price data
+  const riskLeverage = priceData.length > 30
+    ? calcRiskAdjustedLeverage(priceData, 5, 2, 0.05)
+    : null;
+
+  // Generate leverage configs based on RLmax
+  const leverageConfigs: Array<{ minLeverage: number; targetLeverage: number; maxLeverage: number }> = [];
+  if (riskLeverage && riskLeverage.rlmax > 1) {
+    const rlmax = riskLeverage.rlmax;
+    for (let target = 2; target <= Math.min(rlmax, 6); target++) {
+      leverageConfigs.push({
+        minLeverage: Math.max(1, target - 2),
+        targetLeverage: target,
+        maxLeverage: Math.min(rlmax, target + 3),
+      });
+    }
+  } else {
+    leverageConfigs.push(
+      { minLeverage: 1, targetLeverage: 2, maxLeverage: 4 },
+      { minLeverage: 1, targetLeverage: 3, maxLeverage: 5 },
+    );
+  }
+
   let bestResult: VenuePairResult | null = null;
 
-  for (const exitOnNeg of [false, true]) {
-    const config: Partial<BacktestConfig> = {
-      initialCapital: CAPITAL,
-      strategy: pair.strategy,
-      fundingThreshold: 0.00001,
-      maxSpreadBps: 100,
-      maxPositionSize: CAPITAL * 0.5,
-      venueA: pair.venueA,
-      venueB: pair.venueB,
-      feeA,
-      feeB,
-      useMakerFees: false,
-      exitOnNegativeFunding: exitOnNeg,
-      perpLeverageA: pair.strategy === "perp_vs_perp" ? 3 : 2,
-      perpLeverageB: pair.strategy === "perp_vs_perp" ? 3 : 2,
-      priceData,
-    };
-
-    try {
-      const result = runBacktest(ratesA, ratesB, config);
-      const netPnl = result.totalPnl;
-      const netProfitPct = (netPnl / CAPITAL) * 100;
-      const totalFunding = result.totalFundingCollected - result.totalFundingPaid;
-
-      const entry: VenuePairResult = {
-        venueA: pair.venueA,
-        venueB: pair.venueB,
-        label: pair.label,
-        strategy: pair.strategy,
-        coin,
-        coinName: market.name,
-        category: market.category,
-        netPnl,
-        netProfitPct,
-        totalFees: result.totalFees,
-        totalFunding,
-        trades: result.totalTrades,
-        winRate: result.winRate,
-        maxDrawdownPct: result.maxDrawdownPct * 100,
-        breakevenHours: result.breakevenHours,
-        sharpeRatio: result.sharpeRatio,
-        liquidations: result.liquidationEvents.length,
-        exitOnNegative: exitOnNeg,
+  for (const levCfg of leverageConfigs) {
+    for (const exitOnNeg of [false, true]) {
+      const rebalance: RebalanceConfig = {
+        enabled: true,
+        minLeverage: levCfg.minLeverage,
+        targetLeverage: levCfg.targetLeverage,
+        maxLeverage: levCfg.maxLeverage,
+        deviationThreshold: 0.15,
       };
 
-      // Pick best by PnL
-      if (!bestResult || entry.netPnl > bestResult.netPnl) {
-        bestResult = entry;
+      const config: Partial<BacktestConfig> = {
+        initialCapital: CAPITAL,
+        strategy: pair.strategy,
+        fundingThreshold: 0.00001,
+        maxSpreadBps: 100,
+        maxPositionSize: CAPITAL * 0.5,
+        venueA: pair.venueA,
+        venueB: pair.venueB,
+        feeA,
+        feeB,
+        useMakerFees: false,
+        exitOnNegativeFunding: exitOnNeg,
+        perpLeverageA: pair.strategy === "perp_vs_perp" ? levCfg.targetLeverage : 1,
+        perpLeverageB: pair.strategy === "perp_vs_perp" ? levCfg.targetLeverage : levCfg.targetLeverage,
+        priceData,
+        rebalance,
+        coin,
+      };
+
+      try {
+        const result = runBacktest(ratesA, ratesB, config);
+        const netPnl = result.totalPnl;
+        const netProfitPct = (netPnl / CAPITAL) * 100;
+        const totalFunding = result.totalFundingCollected - result.totalFundingPaid;
+
+        const objectiveResult = calcObjectiveFunction(
+          result.pnlHistory,
+          result.timestamps,
+          CAPITAL,
+          levCfg,
+          { alpha: 0.5, beta: 0.3 },
+        );
+
+        const entry: VenuePairResult = {
+          venueA: pair.venueA,
+          venueB: pair.venueB,
+          label: pair.label,
+          strategy: pair.strategy,
+          coin,
+          coinName: market.name,
+          category: market.category,
+          netPnl,
+          netProfitPct,
+          totalFees: result.totalFees,
+          totalFunding,
+          trades: result.totalTrades,
+          winRate: result.winRate,
+          maxDrawdownPct: result.maxDrawdownPct * 100,
+          breakevenHours: result.breakevenHours,
+          sharpeRatio: result.sharpeRatio,
+          liquidations: result.liquidationEvents.length,
+          exitOnNegative: exitOnNeg,
+          objectiveResult,
+          leverageConfig: levCfg,
+          riskLeverage,
+          rebalances: result.totalRebalances,
+        };
+
+        // Pick best by objective function score
+        const score = objectiveResult.objective > 0 ? objectiveResult.objective : netPnl / 1000;
+        const bestScore = bestResult
+          ? (bestResult.objectiveResult.objective > 0 ? bestResult.objectiveResult.objective : bestResult.netPnl / 1000)
+          : -Infinity;
+
+        if (score > bestScore) {
+          bestResult = entry;
+        }
+      } catch {
+        // skip
       }
-    } catch {
-      // skip
     }
   }
 
@@ -307,6 +374,10 @@ function aggregateByVenuePair(results: VenuePairResult[]): AggregatedVenuePair[]
       totalLiquidations: coins.reduce((s, c) => s + c.liquidations, 0),
       exitOnNegative: coins[0].exitOnNegative,
       coinBreakdown: coins.sort((a, b) => b.netPnl - a.netPnl),
+      avgObjectiveF: coins.reduce((s, c) => s + c.objectiveResult.objective, 0) / coins.length,
+      avgDDq5: coins.reduce((s, c) => s + c.objectiveResult.ddq5, 0) / coins.length,
+      avgLeverageAsym: coins.reduce((s, c) => s + c.objectiveResult.leverageAsymmetry, 0) / coins.length,
+      totalRebalances: coins.reduce((s, c) => s + c.rebalances, 0),
     });
   }
 
@@ -451,13 +522,15 @@ async function main() {
     "Venue Pair".padEnd(32) +
     "Strat".padEnd(12) +
     "Exit".padEnd(5) +
-    "Total PnL".padStart(11) +
-    "Avg%".padStart(7) +
-    "Coins+".padStart(7) +
+    "PnL".padStart(11) +
+    "Prof%".padStart(7) +
+    "C/TC".padStart(7) +
     "Win%".padStart(6) +
-    "AvgDD%".padStart(7) +
+    "DD%".padStart(7) +
     "Sharpe".padStart(7) +
-    "Fees".padStart(9) +
+    "Obj.F".padStart(8) +
+    "DDq5".padStart(7) +
+    "Rebal".padStart(6) +
     "Liq".padStart(5)
   );
   console.log("  " + "-".repeat(W - 2));
@@ -480,7 +553,9 @@ async function main() {
       `${(a.avgWinRate * 100).toFixed(0).padStart(5)}%` +
       `${fmtPct(a.avgMaxDd).padStart(7)}` +
       `${a.avgSharpe.toFixed(2).padStart(7)}` +
-      `${fmtDollar(a.totalFees).padStart(9)}` +
+      `${a.avgObjectiveF.toFixed(3).padStart(8)}` +
+      `${fmtPct(a.avgDDq5).padStart(7)}` +
+      `${String(a.totalRebalances).padStart(6)}` +
       `${(a.totalLiquidations > 0 ? a.totalLiquidations + "!" : "-").padStart(5)}${medal}`
     );
   }
@@ -504,6 +579,10 @@ async function main() {
   console.log(`  Avg Sharpe:      ${winner.avgSharpe.toFixed(2)}`);
   console.log(`  Total Fees:      ${fmtDollar(winner.totalFees)}`);
   console.log(`  Total Trades:    ${winner.totalTrades}`);
+  console.log(`  Obj.F:           ${winner.avgObjectiveF.toFixed(4)}  (higher = better)`);
+  console.log(`  DDq5:            ${fmtPct(winner.avgDDq5)}  (5% quantile drawdown)`);
+  console.log(`  Leverage Asym:   ${winner.avgLeverageAsym.toFixed(4)}  (0 = balanced)`);
+  console.log(`  Rebalances:      ${winner.totalRebalances} across basket`);
   if (winner.totalLiquidations > 0) {
     console.log(`  LIQUIDATIONS:    ${winner.totalLiquidations} events across basket`);
   }
@@ -525,9 +604,9 @@ async function main() {
     "Sharpe".padStart(7) +
     "Win%".padStart(6) +
     "MDD%".padStart(7) +
-    "Trades".padStart(7) +
-    "Fees".padStart(8) +
-    "Breakeven".padStart(11) +
+    "Obj.F".padStart(8) +
+    "RLmax".padStart(7) +
+    "Rebal".padStart(6) +
     "Liq".padStart(5)
   );
   console.log("  " + "-".repeat(W - 2));
@@ -545,9 +624,9 @@ async function main() {
       `${c.sharpeRatio.toFixed(2).padStart(7)}` +
       `${(c.winRate * 100).toFixed(0).padStart(5)}%` +
       `${fmtPct(c.maxDrawdownPct).padStart(7)}` +
-      `${String(c.trades).padStart(7)}` +
-      `${fmtDollar(c.totalFees).padStart(8)}` +
-      `${fmtBe(c.breakevenHours).padStart(11)}` +
+      `${c.objectiveResult.objective.toFixed(3).padStart(8)}` +
+      `${(c.riskLeverage ? c.riskLeverage.rlmax.toFixed(1) : "-").padStart(7)}` +
+      `${String(c.rebalances).padStart(6)}` +
       `${(c.liquidations > 0 ? c.liquidations + "!" : "-").padStart(5)}`
     );
   }
@@ -660,6 +739,13 @@ async function main() {
   console.log(`  Use ${winner.label} for your basket.`);
   console.log(`  Strategy: ${winner.strategy === "spot_vs_perp" ? "Long spot + Short perp (or vice versa)" : "Long perp A + Short perp B"}`);
   console.log(`  Exit mode: ${winner.exitOnNegative ? "Exit when funding turns negative" : "Hold through negative funding"}`);
+  const bestCoin = winner.coinBreakdown[0];
+  if (bestCoin) {
+    const lc = bestCoin.leverageConfig;
+    console.log(`  Leverage:        target ${lc.targetLeverage}x  [${lc.minLeverage}-${lc.maxLeverage}]`);
+    console.log(`  Rebalancing:     every period, drift > 15% of target`);
+    console.log(`  Objective F:     ${bestCoin.objectiveResult.objective.toFixed(4)}`);
+  }
   console.log();
 
   const profitable = winner.coinBreakdown.filter((c) => c.netPnl > 0);
@@ -668,7 +754,8 @@ async function main() {
   if (profitable.length > 0) {
     console.log(`  Trade these coins on ${winner.label}:`);
     for (const c of profitable) {
-      console.log(`    + ${c.coin.padEnd(8)} ${fmtDollar(c.netPnl).padStart(8)}  (${fmtPct(c.netProfitPct)})`);
+      const rl = c.riskLeverage ? ` RLmax=${c.riskLeverage.rlmax.toFixed(1)}x` : "";
+      console.log(`    + ${c.coin.padEnd(8)} ${fmtDollar(c.netPnl).padStart(8)}  (${fmtPct(c.netProfitPct)})${rl}  F=${c.objectiveResult.objective.toFixed(3)}  rebal=${c.rebalances}`);
     }
   }
   if (skip.length > 0) {

@@ -49,6 +49,37 @@ export interface FlipConfig {
   flipCooldownHours: number;    // min hours between flips (prevent flip-flopping)
 }
 
+export interface RebalanceConfig {
+  enabled: boolean;
+  minLeverage: number;          // Lmin - minimum leverage bound
+  targetLeverage: number;       // Ltarget - target leverage to maintain
+  maxLeverage: number;          // Lmax - maximum leverage bound
+  deviationThreshold: number;   // ε - rebalance when hedge deviates by this fraction of spot target
+}
+
+export interface ObjectiveFunctionConfig {
+  alpha: number;                // drawdown penalty weight
+  beta: number;                 // leverage asymmetry penalty weight
+}
+
+export interface ObjectiveFunctionResult {
+  avgApy: number;               // Ā - mean APY across trajectories
+  ddq5: number;                 // DDq5 - 5% quantile max drawdown
+  deltaMax: number;             // Δmax = Lmax - Ltarget
+  deltaMin: number;             // Δmin = Ltarget - Lmin
+  leverageAsymmetry: number;    // Δ = |Δmax - Δmin|
+  drawdownPenalty: number;      // D1 = 1 - α * DDq5
+  leveragePenalty: number;      // D2 = 1 - β * Δ
+  objective: number;            // F = Ā / (D1 * D2)
+}
+
+export interface RiskAdjustedLeverage {
+  q99_5m: number;               // Q0.99 of 5m price range/open
+  q99_15m: number;              // Q0.99 of 15m price change
+  avgRange5m: number;           // average (high-low)/open for 5m candles
+  rlmax: number;                // risk-adjusted max leverage
+}
+
 export interface BacktestConfig {
   initialCapital: number;
   strategy: StrategyType;
@@ -76,6 +107,14 @@ export interface BacktestConfig {
   venuesBMulti: string[];              // N perp venue names
   priceDataBMulti: Array<{ timestamp: number; price: number }>[]; // N price data arrays
   multiPerpCount: number;              // number of short perp legs
+  // BasisOS: rebalancing config
+  rebalance: RebalanceConfig;
+  // BasisOS: OI-weighted funding
+  useOIFunding: boolean;
+  openInterestData: Array<{ timestamp: number; openInterest: number }>; // OI for venue A
+  openInterestDataB: Array<{ timestamp: number; openInterest: number }>; // OI for venue B
+  // BasisOS: coin identifier for risk-adjusted leverage
+  coin: string;
 }
 
 export interface Trade {
@@ -114,6 +153,9 @@ export interface Trade {
   liquidatedAt?: Date;           // when liquidation happened
   liquidatedLeg?: "A" | "B";    // which leg was liquidated
   liquidationLoss: number;       // PnL lost due to liquidation (on top of normal exit)
+  // BasisOS: rebalance tracking
+  rebalanceCount: number;        // number of rebalances during this trade
+  currentLeverage: number;       // leverage at trade close (or last rebalance)
 }
 
 export interface LiquidationEvent {
@@ -159,6 +201,10 @@ export interface BacktestResult {
   maxPriceSpreadBps: number;    // maximum inter-exchange price spread observed
   totalPriceSpreadPnl: number;  // total PnL contribution from price divergence
   priceSpreadHistory: number[]; // price spread (bps) at each aligned data point
+  // BasisOS: rebalance stats
+  totalRebalances: number;      // total rebalance events across all trades
+  leverageHistory: number[];    // effective leverage at each data point (0 if no position)
+  // BasisOS: objective function (computed separately via calcObjectiveFunction)
 }
 
 interface AlignedData {
@@ -316,6 +362,183 @@ function calcEntryExitCostBps(
   return roundTripCost * leverage;
 }
 
+// ── BasisOS: OI-Weighted Funding Rate ──
+
+function buildOILookup(
+  oiData: Array<{ timestamp: number; openInterest: number }>
+): (ts: number) => number {
+  if (oiData.length === 0) return () => 0;
+  return (ts: number): number => {
+    let lo = 0, hi = oiData.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (oiData[mid].timestamp < ts) lo = mid + 1;
+      else hi = mid;
+    }
+    let best = lo;
+    if (lo > 0 && Math.abs(oiData[lo - 1].timestamp - ts) < Math.abs(oiData[lo].timestamp - ts)) {
+      best = lo - 1;
+    }
+    if (Math.abs(oiData[best].timestamp - ts) > 2 * 3600 * 1000) return 0;
+    return oiData[best].openInterest;
+  };
+}
+
+function calcWFRI(
+  fundingRates: number[],
+  openInterests: number[]
+): number {
+  let numerator = 0;
+  let denominator = 0;
+  for (let i = 0; i < fundingRates.length; i++) {
+    const oi = openInterests[i] || 1;
+    numerator += fundingRates[i] * oi;
+    denominator += oi;
+  }
+  return denominator > 0 ? numerator / denominator : 0;
+}
+
+function calcAFRI(fundingRates: number[]): number {
+  if (fundingRates.length === 0) return 0;
+  return fundingRates.reduce((s, r) => s + r, 0) / fundingRates.length;
+}
+
+// ── BasisOS: Risk-Adjusted Leverage (RLmax) ──
+
+export function calcRiskAdjustedLeverage(
+  priceData: Array<{ timestamp: number; price: number }>,
+  candleMinutes: number = 5,
+  executionLatencyMinutes: number = 2,
+  maintenanceMarginPct: number = 0.05
+): RiskAdjustedLeverage {
+  if (priceData.length < 30) {
+    return { q99_5m: 0.05, q99_15m: 0.08, avgRange5m: 0.03, rlmax: 6 };
+  }
+
+  // Build candles from tick data
+  const candleMs = candleMinutes * 60 * 1000;
+  const candles: Array<{ high: number; low: number; open: number; close: number }> = [];
+  let currentCandle: { high: number; low: number; open: number; close: number } | null = null;
+  let currentCandleStart = 0;
+
+  for (const p of priceData) {
+    const candleStart = Math.floor(p.timestamp / candleMs) * candleMs;
+    if (candleStart !== currentCandleStart || !currentCandle) {
+      if (currentCandle) candles.push(currentCandle);
+      currentCandle = { high: p.price, low: p.price, open: p.price, close: p.price };
+      currentCandleStart = candleStart;
+    } else {
+      currentCandle.high = Math.max(currentCandle.high, p.price);
+      currentCandle.low = Math.min(currentCandle.low, p.price);
+      currentCandle.close = p.price;
+    }
+  }
+  if (currentCandle) candles.push(currentCandle);
+
+  if (candles.length < 20) {
+    return { q99_5m: 0.05, q99_15m: 0.08, avgRange5m: 0.03, rlmax: 6 };
+  }
+
+  // Calculate metrics
+  const ranges = candles.map(c => c.open > 0 ? (c.high - c.low) / c.open : 0);
+  const pctChanges = candles.slice(1).map((c, i) => {
+    const prevClose = candles[i].close;
+    return prevClose > 0 ? Math.abs(c.close - prevClose) / prevClose : 0;
+  });
+
+  // Q99 of range/open (5m)
+  const sortedRanges = [...ranges].sort((a, b) => a - b);
+  const q99RangeIdx = Math.floor(sortedRanges.length * 0.99);
+  const q99_5m = sortedRanges[Math.min(q99RangeIdx, sortedRanges.length - 1)];
+
+  // Q99 of 15m price changes (aggregate 3 candles)
+  const changes15m: number[] = [];
+  for (let i = 2; i < candles.length; i++) {
+    const open3 = candles[i - 2].open;
+    const close1 = candles[i].close;
+    if (open3 > 0) changes15m.push(Math.abs(close1 - open3) / open3);
+  }
+  const sortedChanges15m = changes15m.sort((a, b) => a - b);
+  const q99_15mIdx = Math.floor(sortedChanges15m.length * 0.99);
+  const q99_15m = sortedChanges15m[Math.min(q99_15mIdx, sortedChanges15m.length - 1)] || q99_5m * 1.5;
+
+  const avgRange5m = ranges.reduce((s, r) => s + r, 0) / ranges.length;
+
+  // RLmax: L(PMT / (1 + Q99_15m))
+  // PMT = Pliq * MT, where MT = Q99 of 5m price change
+  // Simplified: RLmax ≈ 1 / (maintenanceMargin + Q99_5m + executionLatency * avgPriceMove)
+  const latencyFactor = executionLatencyMinutes / candleMinutes;
+  const effectiveVol = q99_5m + latencyFactor * avgRange5m;
+  const rlmax = Math.max(1, Math.min(15, 1 / (maintenanceMarginPct + effectiveVol)));
+
+  return { q99_5m, q99_15m, avgRange5m, rlmax };
+}
+
+// ── BasisOS: Objective Function ──
+
+export function calcObjectiveFunction(
+  pnlHistory: number[],
+  timestamps: number[],
+  initialCapital: number,
+  leverageConfig: { minLeverage: number; targetLeverage: number; maxLeverage: number },
+  config: ObjectiveFunctionConfig = { alpha: 0.5, beta: 0.3 }
+): ObjectiveFunctionResult {
+  // Calculate returns series from PnL history
+  const returns: number[] = [];
+  for (let i = 1; i < pnlHistory.length; i++) {
+    returns.push((pnlHistory[i] - pnlHistory[i - 1]) / initialCapital);
+  }
+
+  if (returns.length === 0) {
+    return {
+      avgApy: 0, ddq5: 0, deltaMax: 0, deltaMin: 0,
+      leverageAsymmetry: 0, drawdownPenalty: 1, leveragePenalty: 1, objective: 0,
+    };
+  }
+
+  // Mean APY (annualized from mean period return)
+  const meanReturn = returns.reduce((s, r) => s + r, 0) / returns.length;
+  const periodsPerYear = returns.length > 0 && timestamps.length > 1
+    ? (365 * 24 * 3600 * 1000) / ((timestamps[timestamps.length - 1] - timestamps[0]) / returns.length)
+    : 365 * 24;
+  const avgApy = meanReturn * periodsPerYear;
+
+  // Max drawdown per simulation trajectory (use full history as single trajectory)
+  let peak = 0;
+  let maxDd = 0;
+  for (const pnl of pnlHistory) {
+    if (pnl > peak) peak = pnl;
+    const dd = (peak - pnl) / initialCapital;
+    if (dd > maxDd) maxDd = dd;
+  }
+  const ddq5 = maxDd; // Single trajectory: DDq5 = max drawdown
+
+  // Leverage asymmetry
+  const deltaMax = leverageConfig.maxLeverage - leverageConfig.targetLeverage;
+  const deltaMin = leverageConfig.targetLeverage - leverageConfig.minLeverage;
+  const leverageAsymmetry = Math.abs(deltaMax - deltaMin);
+
+  // Penalties
+  const drawdownPenalty = Math.max(0.01, 1 - config.alpha * ddq5);
+  const leveragePenalty = Math.max(0.01, 1 - config.beta * leverageAsymmetry);
+
+  // Objective: F = Ā / (D1 * D2)
+  const objective = drawdownPenalty > 0 && leveragePenalty > 0
+    ? avgApy / (drawdownPenalty * leveragePenalty)
+    : 0;
+
+  return {
+    avgApy,
+    ddq5,
+    deltaMax,
+    deltaMin,
+    leverageAsymmetry,
+    drawdownPenalty,
+    leveragePenalty,
+    objective,
+  };
+}
+
 function getConfig(config: Partial<BacktestConfig>): BacktestConfig {
   const isPerpVsPerp = config.strategy === "perp_vs_perp";
 
@@ -350,6 +573,17 @@ function getConfig(config: Partial<BacktestConfig>): BacktestConfig {
     venuesBMulti: config.venuesBMulti ?? [],
     priceDataBMulti: config.priceDataBMulti ?? [],
     multiPerpCount: config.multiPerpCount ?? 0,
+    rebalance: config.rebalance ?? {
+      enabled: false,
+      minLeverage: 1,
+      targetLeverage: 2,
+      maxLeverage: 4,
+      deviationThreshold: 0.15,
+    },
+    useOIFunding: config.useOIFunding ?? false,
+    openInterestData: config.openInterestData ?? [],
+    openInterestDataB: config.openInterestDataB ?? [],
+    coin: config.coin ?? "",
   };
 }
 
@@ -401,6 +635,8 @@ export function runBacktest(
   let priceSpreadSum = 0;
   let priceSpreadCount = 0;
   const priceSpreadHistory: number[] = [];
+  const leverageHistory: number[] = [];
+  let totalRebalances = 0;
 
   // Helper: get price for a venue, falling back to legacy single price data
   function getPrice(venue: "A" | "B", ts: number): number | null {
@@ -503,6 +739,13 @@ export function runBacktest(
     const unrealizedPnlTop = openTrade ? openTrade.pnl : 0;
     pnlHistory.push(cumulativePnl + unrealizedPnlTop);
 
+    // Track leverage history
+    if (openTrade && openTrade.size > 0) {
+      leverageHistory.push(Math.abs(openTrade.notionalB) / openTrade.size);
+    } else {
+      leverageHistory.push(0);
+    }
+
     // Update open trade PnL
     if (openTrade) {
       // Funding differential PnL (leveraged notional)
@@ -548,6 +791,43 @@ export function runBacktest(
         openTrade.priceSpreadPnl += pricePnlDelta;
         openTrade.pnl += pricePnlDelta;
         totalPriceSpreadPnl += pricePnlDelta;
+      }
+
+      // ── BasisOS: Rebalance check ──
+      if (cfg.rebalance.enabled && !openTrade.liquidated) {
+        const currentEquity = cfg.initialCapital + openTrade.pnl;
+        const marginBalance = openTrade.size;
+        const currentLeverage = marginBalance > 0 ? Math.abs(openTrade.notionalB) / marginBalance : 0;
+        const { minLeverage, targetLeverage, maxLeverage, deviationThreshold } = cfg.rebalance;
+
+        let shouldRebalance = false;
+        if (currentLeverage < minLeverage || currentLeverage > maxLeverage) {
+          shouldRebalance = true;
+        } else {
+          const targetHedge = currentEquity * targetLeverage / (1 + targetLeverage);
+          const hedgeDeviation = Math.abs(openTrade.notionalB - targetHedge);
+          if (hedgeDeviation > deviationThreshold * targetHedge) {
+            shouldRebalance = true;
+          }
+        }
+
+        if (shouldRebalance && currentEquity > 0) {
+          const newMargin = currentEquity / (1 + targetLeverage);
+          const newNotionalA = newMargin;
+          const newNotionalB = newMargin * targetLeverage;
+          const rebalanceCostBps = calcEntryExitCostBps(cfg.feeB, cfg.useMakerFees, targetLeverage);
+          const rebalanceCost = (Math.abs(newNotionalB - openTrade.notionalB) * rebalanceCostBps) / 10000;
+
+          openTrade.notionalA = newNotionalA;
+          openTrade.notionalB = newNotionalB;
+          openTrade.size = newMargin;
+          openTrade.leverageA = 1;
+          openTrade.leverageB = targetLeverage;
+          openTrade.feesPaid += rebalanceCost;
+          openTrade.pnl -= rebalanceCost;
+          openTrade.rebalanceCount++;
+          totalFees += rebalanceCost;
+        }
       }
 
       // Track actual breakeven within this trade
@@ -672,6 +952,7 @@ export function runBacktest(
             const prevFlipCount: number = openTrade.flipCount;
 
             capital += openTrade.pnl;
+            totalRebalances += openTrade.rebalanceCount;
             trades.push(openTrade);
 
             // Open flipped position immediately
@@ -712,6 +993,8 @@ export function runBacktest(
               priceSpreadPnl: 0,
               liquidated: false,
               liquidationLoss: 0,
+              rebalanceCount: 0,
+              currentLeverage: prevLevB,
             };
             totalFees += totalEntryCost;
             flipCostPaid += totalEntryCost;
@@ -803,6 +1086,8 @@ export function runBacktest(
         priceSpreadPnl: 0,
         liquidated: false,
         liquidationLoss: 0,
+        rebalanceCount: 0,
+        currentLeverage: leverageB,
       };
       totalFees += totalEntryCost;
       negativeFundingHoursAccum = 0;
@@ -863,6 +1148,7 @@ export function runBacktest(
         totalFees += totalExitCost;
 
         capital += openTrade.pnl;
+        totalRebalances += openTrade.rebalanceCount;
         trades.push(openTrade);
         openTrade = null;
         negativeFundingHoursAccum = 0;
@@ -906,6 +1192,7 @@ export function runBacktest(
     totalFees += totalExitCost;
 
     capital += openTrade.pnl;
+    totalRebalances += openTrade.rebalanceCount;
     trades.push(openTrade);
     // Update last PnL entry with final exit fees applied
     pnlHistory[pnlHistory.length - 1] = trades.reduce((sum, t) => sum + t.pnl, 0);
@@ -981,6 +1268,8 @@ export function runBacktest(
     maxPriceSpreadBps,
     totalPriceSpreadPnl,
     priceSpreadHistory,
+    totalRebalances,
+    leverageHistory,
   };
 }
 
@@ -1027,6 +1316,8 @@ function runMultiPerpBacktest(
   let priceSpreadSum = 0;
   let priceSpreadCount = 0;
   const priceSpreadHistory: number[] = [];
+  const leverageHistory: number[] = [];
+  let totalRebalances = 0;
 
   function getPrice(venueIdx: number, ts: number): number | null {
     const lookup = lookupsPriceB[venueIdx];
@@ -1075,6 +1366,13 @@ function runMultiPerpBacktest(
     // Record PnL
     const unrealizedPnlTop = openTrade ? openTrade.pnl : 0;
     pnlHistory.push(cumulativePnl + unrealizedPnlTop);
+
+    // Track leverage history
+    if (openTrade && openTrade.size > 0) {
+      leverageHistory.push(Math.abs(openTrade.notionalB) / openTrade.size);
+    } else {
+      leverageHistory.push(0);
+    }
 
     if (openTrade) {
       // Aggregate funding across all N perp legs
@@ -1209,6 +1507,8 @@ function runMultiPerpBacktest(
         priceSpreadPnl: 0,
         liquidated: false,
         liquidationLoss: 0,
+        rebalanceCount: 0,
+        currentLeverage: leverageB,
       };
       totalFees += totalEntryCost;
     }
@@ -1248,6 +1548,7 @@ function runMultiPerpBacktest(
         totalFees += totalExitCost;
 
         capital += openTrade.pnl;
+        totalRebalances += openTrade.rebalanceCount;
         trades.push(openTrade);
         openTrade = null;
       }
@@ -1288,6 +1589,7 @@ function runMultiPerpBacktest(
     totalFees += totalExitCost;
 
     capital += openTrade.pnl;
+    totalRebalances += openTrade.rebalanceCount;
     trades.push(openTrade);
     pnlHistory[pnlHistory.length - 1] = trades.reduce((sum, t) => sum + t.pnl, 0);
   }
@@ -1340,5 +1642,6 @@ function runMultiPerpBacktest(
     timestamps: data.map((d) => d.timestamp),
     liquidationEvents, totalLiquidationLoss,
     avgPriceSpreadBps, maxPriceSpreadBps, totalPriceSpreadPnl, priceSpreadHistory,
+    totalRebalances, leverageHistory,
   };
 }

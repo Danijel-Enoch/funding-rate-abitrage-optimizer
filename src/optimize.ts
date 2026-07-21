@@ -470,3 +470,215 @@ export async function optimizeCoin(
 
   return results;
 }
+
+// === Multi-Perp Optimization: 1 Spot vs N Perps ===
+
+export interface MultiPerpCombo {
+  strategy: "spot_vs_multi_perp";
+  spotId: string;
+  perpVenues: string[];
+  label: string;
+  legCount: number;
+}
+
+export interface MultiPerpOptResult {
+  combo: MultiPerpCombo;
+  result: BacktestResult;
+  netPnl: number;
+  totalFees: number;
+  score: number;
+  exitOnNegative: boolean;
+}
+
+// Generate top-N combinations of N perp venues from the available pool
+function* combinations<T>(arr: T[], n: number): Generator<T[]> {
+  if (n === 0) { yield []; return; }
+  for (let i = 0; i <= arr.length - n; i++) {
+    for (const rest of combinations(arr.slice(i + 1), n - 1)) {
+      yield [arr[i], ...rest];
+    }
+  }
+}
+
+function generateMultiPerpCombos(perpVenueIds: string[], maxLegs: number): MultiPerpCombo[] {
+  const combos: MultiPerpCombo[] = [];
+  // Test 2, 3, 4, 5 leg combos (from highest funding venues)
+  for (let n = 2; n <= Math.min(maxLegs, perpVenueIds.length); n++) {
+    // To keep combinations manageable, take top venues by data availability
+    // and limit to first 8 candidates
+    const candidates = perpVenueIds.slice(0, Math.min(8, perpVenueIds.length));
+    for (const perps of combinations(candidates, n)) {
+      const names = perps.map((id) => {
+        const p = getPerpExchange(id);
+        return p?.info.name ?? id;
+      });
+      combos.push({
+        strategy: "spot_vs_multi_perp",
+        spotId: "uniswap",
+        perpVenues: perps,
+        label: `Spot vs ${names.join(" + ")}`,
+        legCount: n,
+      });
+    }
+  }
+  return combos;
+}
+
+export async function optimizeMultiPerp(
+  coin: string,
+  days: number,
+  capital: number,
+  maxLegs: number = 4,
+  onProgress?: (current: number, total: number, combo: MultiPerpCombo) => void
+): Promise<MultiPerpOptResult[]> {
+  const endTime = Date.now();
+  const startTime = endTime - days * 24 * 60 * 60 * 1000;
+
+  // Fetch funding data for all perp venues
+  const fundingCache = new Map<string, FundingRateEntry[]>();
+  const perpVenueIds = perpExchanges.map((e) => e.info.id);
+
+  for (const venueId of perpVenueIds) {
+    try {
+      const data = await fetchVenueFunding(venueId, coin, startTime, endTime);
+      fundingCache.set(venueId, data);
+    } catch {
+      fundingCache.set(venueId, []);
+    }
+  }
+
+  // Only use venues that have data
+  const validVenueIds = perpVenueIds.filter((id) => (fundingCache.get(id)?.length ?? 0) > 0);
+
+  // Fetch spot price data
+  let spotPriceData: Array<{ timestamp: number; price: number }> = [];
+  try {
+    const uni = new UniswapSpotExchange();
+    const symbol = coin.endsWith("USDT") ? coin : `${coin}USDT`;
+    spotPriceData = await uni.fetchPrices(symbol, startTime, endTime);
+  } catch {}
+
+  // Fetch per-venue price data
+  const priceCache = new Map<string, Array<{ timestamp: number; price: number }>>();
+  for (const venueId of validVenueIds) {
+    try {
+      const data = await fetchVenuePrices(venueId, coin, startTime, endTime);
+      priceCache.set(venueId, data);
+    } catch {
+      priceCache.set(venueId, []);
+    }
+  }
+
+  // Also fetch single-perp results for comparison
+  const singleResults: OptimizationResult[] = [];
+  for (const venueId of validVenueIds) {
+    const ratesB = fundingCache.get(venueId) || [];
+    if (ratesB.length === 0) continue;
+    const ratesA = ratesB.map((r) => ({ ...r, fundingRate: 0, coin: "spot" }));
+    const feeA = EXCHANGE_FEES["uniswap"] ?? EXCHANGE_FEES.hyperliquid;
+    const feeB = EXCHANGE_FEES[venueId] ?? EXCHANGE_FEES.hyperliquid;
+
+    const config: Partial<BacktestConfig> = {
+      initialCapital: capital,
+      strategy: "spot_vs_perp",
+      fundingThreshold: 0.00001,
+      maxSpreadBps: 100,
+      maxPositionSize: capital * 0.5,
+      venueA: "uniswap",
+      venueB: venueId,
+      feeA,
+      feeB,
+      perpLeverageA: 1,
+      perpLeverageB: 3,
+      priceData: spotPriceData,
+      priceDataA: spotPriceData,
+      priceDataB: priceCache.get(venueId) || spotPriceData,
+    };
+    const result = runBacktest(ratesA, ratesB, config);
+    singleResults.push({
+      combo: { strategy: "spot_vs_perp", spotId: "uniswap", perpA: "uniswap", perpB: venueId, label: `Spot vs ${getPerpExchange(venueId)?.info.name ?? venueId}` },
+      result,
+      netPnl: result.totalPnl,
+      totalFees: result.totalFees,
+      apy: result.annualizedReturn * 100,
+      maxDrawdownPct: result.maxDrawdownPct * 100,
+      score: calcScore(result.totalPnl, result.maxDrawdownPct),
+      exitOnNegative: false,
+    });
+  }
+
+  // Generate multi-perp combos
+  const multiCombos = generateMultiPerpCombos(validVenueIds, maxLegs);
+  const multiResults: MultiPerpOptResult[] = [];
+
+  for (let i = 0; i < multiCombos.length; i++) {
+    const combo = multiCombos[i];
+    onProgress?.(i + 1, multiCombos.length, combo);
+
+    // Get rates for each leg
+    const ratesBMulti = combo.perpVenues.map((id) => fundingCache.get(id) || []);
+    if (ratesBMulti.some((r) => r.length === 0)) continue;
+
+    const feesBMulti = combo.perpVenues.map((id) => EXCHANGE_FEES[id] ?? EXCHANGE_FEES.hyperliquid);
+    const priceDataBMulti = combo.perpVenues.map((id) => priceCache.get(id) || spotPriceData);
+
+    // Use first perp's funding for the spot leg timing
+    const ratesA = ratesBMulti[0].map((r) => ({ ...r, fundingRate: 0, coin: "spot" }));
+
+    for (const exitOnNeg of [false, true]) {
+      const config: Partial<BacktestConfig> = {
+        initialCapital: capital,
+        strategy: "spot_vs_multi_perp",
+        fundingThreshold: 0.00001,
+        maxSpreadBps: 100,
+        maxPositionSize: capital * 0.5,
+        venueA: "uniswap",
+        venueB: combo.perpVenues[0],
+        feeA: EXCHANGE_FEES["uniswap"] ?? EXCHANGE_FEES.hyperliquid,
+        feeB: feesBMulti[0],
+        perpLeverageA: 1,
+        perpLeverageB: 3,
+        useMakerFees: false,
+        exitOnNegativeFunding: exitOnNeg,
+        priceData: spotPriceData,
+        priceDataA: spotPriceData,
+        priceDataB: priceDataBMulti[0],
+        ratesBMulti,
+        feesBMulti,
+        venuesBMulti: combo.perpVenues,
+        priceDataBMulti,
+        multiPerpCount: combo.legCount,
+      };
+
+      const result = runBacktest(ratesA, ratesBMulti[0], config);
+      const score = calcScore(result.totalPnl, result.maxDrawdownPct);
+
+      multiResults.push({
+        combo,
+        result,
+        netPnl: result.totalPnl,
+        totalFees: result.totalFees,
+        score,
+        exitOnNegative: exitOnNeg,
+      });
+    }
+  }
+
+  multiResults.sort((a, b) => b.score - a.score);
+
+  // Log single-perp summary
+  if (singleResults.length > 0) {
+    const bestSingle = singleResults.sort((a, b) => b.score - a.score)[0];
+    console.log(`\n  Best single-perp: ${bestSingle.combo.label} | PnL: $${bestSingle.netPnl.toFixed(0)} | Score: ${bestSingle.score.toFixed(0)}`);
+    if (multiResults.length > 0) {
+      const bestMulti = multiResults[0];
+      console.log(`  Best multi-perp (${bestMulti.combo.legCount} legs): ${bestMulti.combo.label} | PnL: $${bestMulti.netPnl.toFixed(0)} | Score: ${bestMulti.score.toFixed(0)}`);
+      const improvement = bestSingle.netPnl > 0
+        ? ((bestMulti.netPnl - bestSingle.netPnl) / Math.abs(bestSingle.netPnl) * 100).toFixed(1)
+        : "n/a";
+      console.log(`  Improvement: ${improvement}%`);
+    }
+  }
+
+  return multiResults;
+}

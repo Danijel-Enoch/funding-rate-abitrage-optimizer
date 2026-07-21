@@ -16,7 +16,7 @@ import { UniswapSpotExchange } from "./exchanges/uniswap";
 import { BinanceSpotExchange } from "./exchanges/binance";
 import { runBacktest, type BacktestConfig } from "./backtest";
 import { MARKETS, getCategories, getMarketsByCategory, type MarketConfig } from "./markets";
-import { optimizeCoin, analyzeCrossovers } from "./optimize";
+import { optimizeCoin, analyzeCrossovers, optimizeMultiPerp, MultiPerpOptResult } from "./optimize";
 
 const hl = new HyperliquidExchange();
 const spot = new UniswapSpotExchange();
@@ -35,6 +35,11 @@ if (args[0] === "--list") {
   MODE = "--markets";
 } else if (args[0] === "--optimize") {
   MODE = "--optimize";
+  VENUE_A = args[1] || "ETH";
+  DAYS = parseInt(args[2] || "30");
+  INITIAL_CAPITAL = parseFloat(args[3] || "50000");
+} else if (args[0] === "--multi") {
+  MODE = "--multi";
   VENUE_A = args[1] || "ETH";
   DAYS = parseInt(args[2] || "30");
   INITIAL_CAPITAL = parseFloat(args[3] || "50000");
@@ -479,6 +484,134 @@ async function main() {
 
     console.log();
     console.log("=".repeat(98));
+    return;
+  }
+
+  if (MODE === "--multi") {
+    const coin = VENUE_A.toUpperCase();
+    const MAX_LEGS = 4;
+    console.log("=".repeat(100));
+    console.log("  MULTI-PERP BASIS TRADING OPTIMIZER");
+    console.log("  Tests: 1 Spot vs N Perps (2, 3, 4 legs)");
+    console.log("  Compares single-perp vs multi-perp ROI");
+    console.log("=".repeat(100));
+    console.log();
+    console.log(`  Coin:    ${coin}`);
+    console.log(`  Period:  ${DAYS} days`);
+    console.log(`  Capital: $${INITIAL_CAPITAL.toLocaleString()}`);
+    console.log(`  Max Legs: ${MAX_LEGS}`);
+    console.log();
+    console.log("  Fetching data from all exchanges...\n");
+
+    const results = await optimizeMultiPerp(coin, DAYS, INITIAL_CAPITAL, MAX_LEGS, (cur, total, combo) => {
+      process.stdout.write(`\r  [${cur}/${total}] ${combo.label.padEnd(50)}`);
+    });
+
+    process.stdout.write("\r" + " ".repeat(70) + "\r");
+
+    if (results.length === 0) {
+      console.log("  No data available. Try a different coin or period.");
+      return;
+    }
+
+    // Group by leg count
+    const single = results.filter((r) => r.combo.legCount === 1);
+    const two = results.filter((r) => r.combo.legCount === 2);
+    const three = results.filter((r) => r.combo.legCount === 3);
+    const four = results.filter((r) => r.combo.legCount === 4);
+
+    const printGroup = (label: string, group: MultiPerpOptResult[]) => {
+      if (group.length === 0) return;
+      const sorted = group.sort((a, b) => b.score - a.score);
+      console.log();
+      console.log("=".repeat(100));
+      console.log(`  ${label} (${sorted.length} combos)`);
+      console.log("-".repeat(100));
+      console.log(
+        "  " +
+        "#".padStart(3) + "  " +
+        "Venue Combo".padEnd(50) +
+        "Net PnL".padStart(10) +
+        "Fees".padStart(8) +
+        "Trades".padStart(7) +
+        "Win%".padStart(6) +
+        "MDD%".padStart(7) +
+        "Score".padStart(8) +
+        "Breach".padStart(8)
+      );
+      console.log("-".repeat(100));
+
+      for (let i = 0; i < Math.min(sorted.length, 10); i++) {
+        const r = sorted[i];
+        const label = r.combo.label.padEnd(50);
+        const pnl = `$${r.netPnl.toFixed(0)}`.padStart(10);
+        const fees = `$${r.totalFees.toFixed(0)}`.padStart(8);
+        const trades = `${r.result.totalTrades}`.padStart(7);
+        const win = `${(r.result.winRate * 100).toFixed(0)}%`.padStart(6);
+        const dd = `${(r.result.maxDrawdownPct * 100).toFixed(1)}%`.padStart(7);
+        const score = `${r.score.toFixed(0)}`.padStart(8);
+        const be = r.result.breakevenHours;
+        let beStr: string;
+        if (be < 0) beStr = "never";
+        else if (be < 24) beStr = `${be}h`;
+        else beStr = `${(be / 24).toFixed(1)}d`;
+        const medal = i === 0 ? " <- BEST" : "";
+        console.log(`  ${(i + 1 + ".").padStart(4)} ${label}${pnl}${fees}${trades}${win}${dd}${score}${beStr.padStart(8)}${medal}`);
+      }
+      console.log("-".repeat(100));
+    };
+
+    printGroup("SINGLE PERP (1 Spot vs 1 Perp)", single);
+    printGroup("TWO PERPS (1 Spot vs 2 Perps)", two);
+    printGroup("THREE PERPS (1 Spot vs 3 Perps)", three);
+    printGroup("FOUR PERPS (1 Spot vs 4 Perps)", four);
+
+    // Summary comparison
+    const bestOf = (group: MultiPerpOptResult[]) => group.sort((a, b) => b.score - a.score)[0];
+    const bestSingle = bestOf(single);
+    const bestTwo = bestOf(two);
+    const bestThree = bestOf(three);
+    const bestFour = bestOf(four);
+
+    console.log();
+    console.log("=".repeat(100));
+    console.log("  SUMMARY: Best per leg count");
+    console.log("-".repeat(100));
+
+    const summaryRow = (legs: string, best: MultiPerpOptResult | undefined) => {
+      if (!best) return;
+      const roi = ((best.netPnl / INITIAL_CAPITAL) * 100).toFixed(2);
+      const ann = (best.result.annualizedReturn * 100).toFixed(1);
+      console.log(
+        `  ${legs.padEnd(12)}` +
+        `PnL: $${best.netPnl.toFixed(0).padStart(8)}` +
+        `  ROI: ${(roi + "%").padStart(8)}` +
+        `  Ann: ${(ann + "%").padStart(7)}` +
+        `  Fees: $${best.totalFees.toFixed(0).padStart(6)}` +
+        `  Trades: ${String(best.result.totalTrades).padStart(4)}` +
+        `  Score: ${best.score.toFixed(0).padStart(8)}` +
+        `  ${best.combo.label}`
+      );
+    };
+
+    summaryRow("1 perp", bestSingle);
+    summaryRow("2 perps", bestTwo);
+    summaryRow("3 perps", bestThree);
+    summaryRow("4 perps", bestFour);
+
+    // Improvement calc
+    if (bestSingle && bestFour) {
+      const improvement = bestSingle.netPnl > 0
+        ? ((bestFour.netPnl - bestSingle.netPnl) / Math.abs(bestSingle.netPnl) * 100).toFixed(1)
+        : "n/a";
+      const feeIncrease = bestFour.totalFees - bestSingle.totalFees;
+      console.log();
+      console.log(`  4-perp vs 1-perp improvement: ${improvement}%`);
+      console.log(`  Extra fees from 3 additional legs: $${feeIncrease.toFixed(0)}`);
+      console.log(`  Net benefit: $${(bestFour.netPnl - bestSingle.netPnl).toFixed(0)}`);
+    }
+
+    console.log("=".repeat(100));
     return;
   }
 

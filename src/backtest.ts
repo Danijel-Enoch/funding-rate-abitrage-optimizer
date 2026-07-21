@@ -11,7 +11,7 @@
 
 import type { FundingRateEntry } from "./exchanges/types";
 
-export type StrategyType = "spot_vs_perp" | "perp_vs_perp";
+export type StrategyType = "spot_vs_perp" | "perp_vs_perp" | "spot_vs_multi_perp";
 
 // Fee model for each exchange
 export interface FeeModel {
@@ -70,6 +70,12 @@ export interface BacktestConfig {
   priceDataB: Array<{ timestamp: number; price: number }>; // price data from venue B
   maintenanceMarginBps: number; // maintenance margin in bps (e.g., 500 = 5%)
   maxPriceSpreadBps: number;   // max inter-exchange price spread (bps) to enter a trade
+  // Multi-perp config (spot_vs_multi_perp strategy)
+  ratesBMulti: FundingRateEntry[][];   // N perp funding rate streams
+  feesBMulti: FeeModel[];              // N perp fee models
+  venuesBMulti: string[];              // N perp venue names
+  priceDataBMulti: Array<{ timestamp: number; price: number }>[]; // N price data arrays
+  multiPerpCount: number;              // number of short perp legs
 }
 
 export interface Trade {
@@ -191,6 +197,72 @@ function calcPriceSpreadBps(priceA: number, priceB: number): number {
   return (Math.abs(priceA - priceB) / avg) * 10000;
 }
 
+// Multi-perp alignment: spot (A) vs N perp venues (B[0], B[1], ...)
+interface AlignedMultiData {
+  timestamp: number;
+  fundingRateA: number;         // spot funding (always 0)
+  fundingRatesB: number[];      // N perp funding rates
+  avgFundingRateB: number;      // average across all perp legs
+  maxFundingRateB: number;      // best (most negative for short = most collected)
+  spreadBps: number;            // funding spread vs best perp
+  priceA: number | null;
+  pricesB: (number | null)[];   // N perp prices
+}
+
+function alignMultiPerpData(
+  ratesA: FundingRateEntry[],
+  ratesBMulti: FundingRateEntry[][],
+  lookupPriceA: (ts: number) => number | null,
+  lookupPriceBMultis: Array<(ts: number) => number | null>,
+): AlignedMultiData[] {
+  // Build timestamp maps for each perp leg
+  const mapsB = ratesBMulti.map((rates) => {
+    const map = new Map<number, number>();
+    for (const r of rates) {
+      const key = Math.floor(r.timestamp / 1000 / 3600) * 3600;
+      map.set(key, r.fundingRate);
+    }
+    return map;
+  });
+
+  const legCount = ratesBMulti.length;
+  const aligned: AlignedMultiData[] = [];
+
+  for (const rA of ratesA) {
+    const key = Math.floor(rA.timestamp / 1000 / 3600) * 3600;
+
+    // Check all legs have data at this timestamp
+    const ratesB: number[] = [];
+    let allPresent = true;
+    for (let i = 0; i < legCount; i++) {
+      const rate = mapsB[i].get(key);
+      if (rate === undefined) { allPresent = false; break; }
+      ratesB.push(rate);
+    }
+    if (!allPresent) continue;
+
+    const avgB = ratesB.reduce((s, r) => s + r, 0) / legCount;
+    // For a short position, we want the most negative funding rate (collect most)
+    const maxB = Math.min(...ratesB);
+    const spreadBps = Math.abs(rA.fundingRate - maxB) * 10000;
+
+    const priceA = lookupPriceA(rA.timestamp);
+    const pricesB = lookupPriceBMultis.map((lookup) => lookup(rA.timestamp));
+
+    aligned.push({
+      timestamp: rA.timestamp,
+      fundingRateA: rA.fundingRate,
+      fundingRatesB: ratesB,
+      avgFundingRateB: avgB,
+      maxFundingRateB: maxB,
+      spreadBps,
+      priceA,
+      pricesB,
+    });
+  }
+  return aligned;
+}
+
 function alignFundingData(
   ratesA: FundingRateEntry[],
   ratesB: FundingRateEntry[],
@@ -273,6 +345,11 @@ function getConfig(config: Partial<BacktestConfig>): BacktestConfig {
     priceDataB: config.priceDataB ?? config.priceData ?? [],
     maintenanceMarginBps: config.maintenanceMarginBps ?? 500, // 5% default
     maxPriceSpreadBps: config.maxPriceSpreadBps ?? 500, // 5% default max price divergence
+    ratesBMulti: config.ratesBMulti ?? [],
+    feesBMulti: config.feesBMulti ?? [],
+    venuesBMulti: config.venuesBMulti ?? [],
+    priceDataBMulti: config.priceDataBMulti ?? [],
+    multiPerpCount: config.multiPerpCount ?? 0,
   };
 }
 
@@ -282,6 +359,11 @@ export function runBacktest(
   config: Partial<BacktestConfig> = {}
 ): BacktestResult {
   const cfg = getConfig(config);
+
+  // Dispatch to multi-perp backtest if configured
+  if (cfg.strategy === "spot_vs_multi_perp" && cfg.ratesBMulti.length > 0) {
+    return runMultiPerpBacktest(ratesA, cfg);
+  }
 
   // Build per-exchange price lookups
   const lookupPriceA = buildPriceLookup(cfg.priceDataA);
@@ -899,5 +981,364 @@ export function runBacktest(
     maxPriceSpreadBps,
     totalPriceSpreadPnl,
     priceSpreadHistory,
+  };
+}
+
+/**
+ * Multi-perp backtest: Long 1 spot + Short N perps
+ * Splits short notional evenly across N perp venues to maximize aggregate funding.
+ */
+function runMultiPerpBacktest(
+  ratesA: FundingRateEntry[],
+  cfg: BacktestConfig
+): BacktestResult {
+  const legCount = cfg.multiPerpCount || cfg.ratesBMulti.length;
+  if (legCount === 0) {
+    // Fallback: run empty backtest
+    return runBacktest(ratesA, [], {});
+  }
+
+  const leverageA = 1; // spot leg = no leverage
+  const leverageB = cfg.perpLeverageB; // leverage on each perp leg
+
+  // Build price lookups for each leg
+  const lookupPriceA = buildPriceLookup(cfg.priceDataA);
+  const lookupsPriceB = cfg.priceDataBMulti.map((pd) => buildPriceLookup(pd));
+  const lookupPriceFallback = buildPriceLookup(cfg.priceData);
+
+  // Align data: spot funding (all zeros) vs N perp funding streams
+  const spotRates = ratesA.map((r) => ({ ...r, fundingRate: 0, coin: "spot" }));
+  const data = alignMultiPerpData(spotRates, cfg.ratesBMulti, lookupPriceA, lookupsPriceB);
+
+  const trades: Trade[] = [];
+  let capital = cfg.initialCapital;
+  let openTrade: Trade | null = null;
+  let cumulativePnl = 0;
+  const pnlHistory: number[] = [0];
+  let skippedDueToSpread = 0;
+  let skippedDueToPriceSpread = 0;
+  let totalFees = 0;
+  let breakevenTimestamp = 0;
+  let breakevenReached = false;
+  const liquidationEvents: LiquidationEvent[] = [];
+  let totalLiquidationLoss = 0;
+  let totalPriceSpreadPnl = 0;
+  let maxPriceSpreadBps = 0;
+  let priceSpreadSum = 0;
+  let priceSpreadCount = 0;
+  const priceSpreadHistory: number[] = [];
+
+  function getPrice(venueIdx: number, ts: number): number | null {
+    const lookup = lookupsPriceB[venueIdx];
+    if (lookup) {
+      const p = lookup(ts);
+      if (p !== null) return p;
+    }
+    return lookupPriceFallback(ts);
+  }
+
+  function checkLiquidation(
+    entryPrice: number, currentPrice: number, leverage: number, notional: number, isLong: boolean
+  ): { liquidated: boolean; loss: number; liqPrice: number } {
+    const mmPct = cfg.maintenanceMarginBps / 10000;
+    const initialMarginPct = 1 / leverage;
+    const priceChangePct = isLong
+      ? (entryPrice - currentPrice) / entryPrice
+      : (currentPrice - entryPrice) / entryPrice;
+    const liqThreshold = initialMarginPct - mmPct;
+    if (priceChangePct >= liqThreshold) {
+      const margin = notional * initialMarginPct;
+      const loss = notional * (priceChangePct - mmPct);
+      const actualLoss = Math.min(loss, margin);
+      const liqPrice = isLong ? entryPrice * (1 - liqThreshold) : entryPrice * (1 + liqThreshold);
+      return { liquidated: true, loss: Math.max(actualLoss, 0), liqPrice };
+    }
+    return { liquidated: false, loss: 0, liqPrice: 0 };
+  }
+
+  for (let i = 1; i < data.length; i++) {
+    const cur = data[i];
+
+    // Record price spread history (use avg across legs vs spot)
+    if (cur.priceA !== null) {
+      const pricesB = cur.pricesB.filter((p): p is number => p !== null);
+      if (pricesB.length > 0) {
+        const avgPriceB = pricesB.reduce((s, p) => s + p, 0) / pricesB.length;
+        const sprd = calcPriceSpreadBps(cur.priceA, avgPriceB);
+        priceSpreadHistory.push(sprd);
+        priceSpreadSum += sprd;
+        priceSpreadCount++;
+        if (sprd > maxPriceSpreadBps) maxPriceSpreadBps = sprd;
+      }
+    }
+
+    // Record PnL
+    const unrealizedPnlTop = openTrade ? openTrade.pnl : 0;
+    pnlHistory.push(cumulativePnl + unrealizedPnlTop);
+
+    if (openTrade) {
+      // Aggregate funding across all N perp legs
+      // Each leg has notionalB = notionalPerSide * leverageB / legCount
+      const notionalPerLeg = openTrade.size * leverageB;
+      let totalFundingDiff = 0;
+
+      for (let leg = 0; leg < legCount; leg++) {
+        const legFunding = notionalPerLeg * cur.fundingRatesB[leg]; // short: collect negative funding
+        totalFundingDiff += legFunding;
+      }
+
+      openTrade.fundingCollected += Math.max(totalFundingDiff, 0);
+      openTrade.fundingPaid += Math.abs(Math.min(totalFundingDiff, 0));
+      openTrade.pnl += totalFundingDiff;
+
+      // Price spread PnL (aggregate across legs)
+      if (cur.priceA !== null && openTrade.entryPriceA > 0) {
+        for (let leg = 0; leg < legCount; leg++) {
+          const curPriceB = cur.pricesB[leg];
+          if (curPriceB !== null && openTrade.entryPriceB > 0) {
+            const entryReturn = (openTrade.entryPriceB - curPriceB) / openTrade.entryPriceB; // short profits when price drops
+            const legPnl = notionalPerLeg * entryReturn;
+            const prevData = data[i - 1];
+            let prevLegPnl = 0;
+            if (prevData.priceA !== null) {
+              const prevPriceB = prevData.pricesB[leg];
+              if (prevPriceB !== null && openTrade.entryPriceB > 0) {
+                prevLegPnl = notionalPerLeg * ((openTrade.entryPriceB - prevPriceB) / openTrade.entryPriceB);
+              }
+            }
+            const delta = legPnl - prevLegPnl;
+            openTrade.priceSpreadPnl += delta;
+            openTrade.pnl += delta;
+            totalPriceSpreadPnl += delta;
+          }
+        }
+      }
+
+      // Liquidation check on each perp leg
+      for (let leg = 0; leg < legCount && !openTrade.liquidated; leg++) {
+        const currentPrice = getPrice(leg, cur.timestamp);
+        if (currentPrice !== null && openTrade.entryPriceB > 0) {
+          const liq = checkLiquidation(openTrade.entryPriceB, currentPrice, leverageB, notionalPerLeg, false); // short
+          if (liq.liquidated) {
+            openTrade.liquidated = true;
+            openTrade.liquidatedAt = new Date(cur.timestamp);
+            openTrade.liquidatedLeg = "B";
+            openTrade.liquidationLoss = liq.loss;
+            openTrade.pnl -= liq.loss;
+            totalLiquidationLoss += liq.loss;
+            liquidationEvents.push({
+              timestamp: cur.timestamp,
+              leg: "B",
+              entryPrice: openTrade.entryPriceB,
+              liquidationPrice: liq.liqPrice,
+              priceMove: ((currentPrice - openTrade.entryPriceB) / openTrade.entryPriceB) * 100,
+              leverage: leverageB,
+              notional: notionalPerLeg,
+              loss: liq.loss,
+              strategy: `Spot vs ${legCount} Perps`,
+            });
+          }
+        }
+      }
+    }
+
+    // Entry logic
+    if (!openTrade) {
+      // Use best (most negative) perp funding rate for entry decision
+      const bestRate = cur.maxFundingRateB;
+      if (bestRate >= 0) continue; // no positive spread to collect
+
+      const fundingDiff = cur.fundingRateA - bestRate;
+      if (fundingDiff < cfg.fundingThreshold) continue;
+
+      // Price spread check: skip if spot vs avg perp price is too wide
+      if (cur.priceA !== null) {
+        const pricesB = cur.pricesB.filter((p): p is number => p !== null);
+        if (pricesB.length > 0) {
+          const avgPriceB = pricesB.reduce((s, p) => s + p, 0) / pricesB.length;
+          const sprd = calcPriceSpreadBps(cur.priceA, avgPriceB);
+          if (sprd > cfg.maxPriceSpreadBps) { skippedDueToPriceSpread++; continue; }
+        }
+      }
+
+      // Position sizing
+      const notionalPerSide = Math.min(capital * 0.5, cfg.maxPositionSize);
+
+      // Calculate total entry fees: 1 spot leg + N perp legs
+      const spotFeeBps = cfg.useMakerFees ? cfg.feeA.makerFeeBps : cfg.feeA.takerFeeBps;
+      const spotSpreadCost = cfg.feeA.avgSpreadBps / 2;
+      let totalPerpFeesBps = 0;
+      for (let leg = 0; leg < legCount; leg++) {
+        const fee = cfg.useMakerFees ? cfg.feesBMulti[leg].makerFeeBps : cfg.feesBMulti[leg].takerFeeBps;
+        totalPerpFeesBps += fee + cfg.feesBMulti[leg].avgSpreadBps / 2;
+      }
+      const totalEntryCostBps = spotFeeBps + spotSpreadCost + totalPerpFeesBps;
+      const entryFee = (notionalPerSide * spotFeeBps + notionalPerSide * totalPerpFeesBps) / 10000;
+      const entrySpreadCost = (notionalPerSide * cfg.feeA.avgSpreadBps + notionalPerSide * (cfg.feesBMulti.reduce((s, f) => s + f.avgSpreadBps, 0) / legCount)) / 2 / 10000;
+      const totalEntryCost = entryFee + entrySpreadCost;
+
+      const entrySpreadBps = Math.abs(cur.avgFundingRateB) * 10000;
+      const expectedPeriods = entrySpreadBps > 0 ? Math.ceil(totalEntryCostBps / entrySpreadBps) : 999;
+      const expectedBreakevenHours = expectedPeriods * 8;
+
+      openTrade = {
+        entryTime: new Date(cur.timestamp),
+        direction: "long_a_short_b",
+        size: notionalPerSide,
+        notionalA: notionalPerSide * leverageA,
+        notionalB: notionalPerSide * leverageB * legCount,
+        leverageA,
+        leverageB,
+        fundingCollected: 0,
+        fundingPaid: 0,
+        feesPaid: totalEntryCost,
+        entryCostBps: totalEntryCostBps,
+        exitCostBps: 0,
+        pnl: -totalEntryCost,
+        entryFundingRateA: cur.fundingRateA,
+        entryFundingRateB: cur.avgFundingRateB,
+        spreadBps: cur.spreadBps,
+        status: "open",
+        flipCount: 0,
+        negativeFundingHours: 0,
+        expectedBreakevenHours,
+        actualBreakevenHours: -1,
+        entryPriceA: cur.priceA ?? 0,
+        entryPriceB: cur.pricesB.find((p): p is number => p !== null) ?? 0,
+        entryPriceSpreadBps: 0,
+        priceSpreadPnl: 0,
+        liquidated: false,
+        liquidationLoss: 0,
+      };
+      totalFees += totalEntryCost;
+    }
+
+    // Exit logic
+    if (openTrade) {
+      const bestRate = cur.maxFundingRateB;
+      const fundingDiff = Math.abs(cur.fundingRateA - bestRate);
+      let shouldExit = false;
+
+      // Exit when spread narrows
+      if (fundingDiff < cfg.fundingThreshold * 0.5) shouldExit = true;
+
+      // Exit when best perp funding turns positive (we'd be paying)
+      if (cfg.exitOnNegativeFunding && bestRate > 0) shouldExit = true;
+
+      if (shouldExit) {
+        const spotExitFee = (openTrade.notionalA * (cfg.useMakerFees ? cfg.feeA.makerFeeBps : cfg.feeA.takerFeeBps)) / 10000;
+        const spotExitSpread = (openTrade.notionalA * cfg.feeA.avgSpreadBps) / 2 / 10000;
+        let perpExitFees = 0;
+        for (let leg = 0; leg < legCount; leg++) {
+          const feeBps = cfg.useMakerFees ? cfg.feesBMulti[leg].makerFeeBps : cfg.feesBMulti[leg].takerFeeBps;
+          perpExitFees += (openTrade.size * leverageB * feeBps) / 10000;
+        }
+        const totalExitCost = spotExitFee + spotExitSpread + perpExitFees;
+
+        openTrade.exitTime = new Date(cur.timestamp);
+        openTrade.exitFundingRateA = cur.fundingRateA;
+        openTrade.exitFundingRateB = cur.avgFundingRateB;
+        openTrade.exitCostBps = totalExitCost / openTrade.size * 10000;
+        openTrade.exitPriceA = cur.priceA ?? 0;
+        openTrade.exitPriceB = cur.pricesB.find((p): p is number => p !== null) ?? 0;
+        openTrade.exitPriceSpreadBps = 0;
+        openTrade.feesPaid += totalExitCost;
+        openTrade.pnl -= totalExitCost;
+        openTrade.status = "closed";
+        totalFees += totalExitCost;
+
+        capital += openTrade.pnl;
+        trades.push(openTrade);
+        openTrade = null;
+      }
+    }
+
+    if (!openTrade) {
+      cumulativePnl = trades.reduce((sum, t) => sum + t.pnl, 0);
+    }
+
+    if (!breakevenReached) {
+      const unrealizedPnl = openTrade ? openTrade.pnl : 0;
+      if (cumulativePnl + unrealizedPnl >= 0) {
+        breakevenReached = true;
+        breakevenTimestamp = cur.timestamp;
+      }
+    }
+  }
+
+  // Close remaining open trade
+  if (openTrade && data.length > 0) {
+    const last = data[data.length - 1];
+    const notionalPerSide = openTrade.size;
+    const spotExitFee = (notionalPerSide * (cfg.useMakerFees ? cfg.feeA.makerFeeBps : cfg.feeA.takerFeeBps)) / 10000;
+    let perpExitFees = 0;
+    for (let leg = 0; leg < legCount; leg++) {
+      const feeBps = cfg.useMakerFees ? cfg.feesBMulti[leg].makerFeeBps : cfg.feesBMulti[leg].takerFeeBps;
+      perpExitFees += (notionalPerSide * leverageB * feeBps) / 10000;
+    }
+    const totalExitCost = spotExitFee + perpExitFees;
+
+    openTrade.exitTime = new Date(last.timestamp);
+    openTrade.exitFundingRateA = last.fundingRateA;
+    openTrade.exitFundingRateB = last.avgFundingRateB;
+    openTrade.exitPriceA = last.priceA ?? 0;
+    openTrade.feesPaid += totalExitCost;
+    openTrade.pnl -= totalExitCost;
+    openTrade.status = "closed";
+    totalFees += totalExitCost;
+
+    capital += openTrade.pnl;
+    trades.push(openTrade);
+    pnlHistory[pnlHistory.length - 1] = trades.reduce((sum, t) => sum + t.pnl, 0);
+  }
+
+  // Stats
+  const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
+  const totalFundingCollected = trades.reduce((s, t) => s + t.fundingCollected, 0);
+  const totalFundingPaid = trades.reduce((s, t) => s + t.fundingPaid, 0);
+  const winningTrades = trades.filter((t) => t.pnl > 0).length;
+  const totalTrades = trades.length;
+
+  let peak = 0, maxDrawdown = 0, maxDrawdownPct = 0;
+  for (const pnl of pnlHistory) {
+    if (pnl > peak) peak = pnl;
+    const dd = peak - pnl;
+    const ddPct = dd / cfg.initialCapital;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+    if (ddPct > maxDrawdownPct) maxDrawdownPct = ddPct;
+  }
+
+  const returns = [];
+  for (let i = 1; i < pnlHistory.length; i++) {
+    returns.push((pnlHistory[i] - pnlHistory[i - 1]) / cfg.initialCapital);
+  }
+  const avg = returns.reduce((a, b) => a + b, 0) / (returns.length || 1);
+  const std = Math.sqrt(returns.reduce((s, r) => s + (r - avg) ** 2, 0) / (returns.length || 1)) || 1;
+  const sharpeRatio = (avg / std) * Math.sqrt(365 * 24);
+
+  const totalDays = data.length / 24;
+  const annualizedReturn = totalDays > 0
+    ? Math.pow(1 + totalPnl / cfg.initialCapital, 365 / totalDays) - 1
+    : 0;
+
+  const avgFundingRateA = 0;
+  const avgFundingRateB = data.reduce((s, d) => s + d.avgFundingRateB, 0) / (data.length || 1);
+  const avgSpreadBps = data.reduce((s, d) => s + d.spreadBps, 0) / (data.length || 1);
+  const avgPriceSpreadBps = priceSpreadCount > 0 ? priceSpreadSum / priceSpreadCount : 0;
+
+  return {
+    trades, totalPnl, totalFees, totalFundingCollected, totalFundingPaid,
+    winRate: totalTrades > 0 ? winningTrades / totalTrades : 0,
+    totalTrades, maxDrawdown, maxDrawdownPct, sharpeRatio, annualizedReturn,
+    avgFundingRateA, avgFundingRateB, avgSpreadBps,
+    skippedDueToSpread, skippedDueToPriceSpread,
+    totalFlips: 0, flipCostPaid: 0,
+    avgNegativeFundingHours: 0,
+    breakevenHours: breakevenTimestamp > 0
+      ? Math.round((breakevenTimestamp - data[0].timestamp) / (1000 * 60 * 60)) : -1,
+    breakevenTimestamp, pnlHistory,
+    timestamps: data.map((d) => d.timestamp),
+    liquidationEvents, totalLiquidationLoss,
+    avgPriceSpreadBps, maxPriceSpreadBps, totalPriceSpreadPnl, priceSpreadHistory,
   };
 }

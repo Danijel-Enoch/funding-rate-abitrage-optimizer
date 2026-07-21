@@ -315,9 +315,14 @@ function backtestCoinOnPair(
         };
 
         // Pick best by objective function score
-        const score = objectiveResult.objective > 0 ? objectiveResult.objective : netPnl / 1000;
+        // Gate on PnL: negative PnL always loses
+        const score = netPnl > 0 && objectiveResult.objective > 0
+          ? objectiveResult.objective
+          : netPnl / 1000;
         const bestScore = bestResult
-          ? (bestResult.objectiveResult.objective > 0 ? bestResult.objectiveResult.objective : bestResult.netPnl / 1000)
+          ? (bestResult.netPnl > 0 && bestResult.objectiveResult.objective > 0
+            ? bestResult.objectiveResult.objective
+            : bestResult.netPnl / 1000)
           : -Infinity;
 
         if (score > bestScore) {

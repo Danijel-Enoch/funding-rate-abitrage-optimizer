@@ -205,6 +205,12 @@ function calcScore(
   maxDrawdownPct: number,
   objectiveResult?: ObjectiveFunctionResult,
 ): number {
+  // If net PnL is negative, always return a negative score
+  // The objective function can produce positive values even with negative PnL
+  // (avgApy computed from mean returns can be positive while total PnL is negative)
+  if (pnl <= 0) {
+    return pnl - maxDrawdownPct * 1000;
+  }
   if (objectiveResult && objectiveResult.objective > 0) {
     // Use BasisOS objective function, scaled to be comparable with old scores
     return objectiveResult.objective * 10000;

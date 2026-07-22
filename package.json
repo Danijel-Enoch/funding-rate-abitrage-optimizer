@@ -13,7 +13,10 @@
     "scan": "bun run src/scanner.ts",
     "optimize-markets": "bun run src/optimize-markets.ts",
     "basket": "bun run src/optimize-basket.ts",
-    "stocks": "bun run src/optimize-stocks.ts"
+    "stocks": "bun run src/optimize-stocks.ts",
+    "api": "cd api && bun run dev",
+    "ui": "cd ui && npm run dev",
+    "dev": "concurrently \"bun run api\" \"bun run ui\""
   },
   "devDependencies": {
     "@types/bun": "latest",

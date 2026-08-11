@@ -66,6 +66,67 @@ export function resampleFundingHourly(rates: FundingRateEntry[]): FundingRateEnt
   return [...out.values()].sort((a, b) => a.timestamp - b.timestamp);
 }
 
+/**
+ * Picks the entry bar so that trade direction is set by the prevailing funding
+ * regime rather than by one bar's noise.
+ *
+ * The backtest engine chooses long/short from the funding differential at the
+ * moment of entry and, with no exit threshold, holds that direction for the
+ * whole run. Funding flips sign hour to hour, so entering on the first available
+ * bar makes the result a coin flip — shifting the start by a few hours can turn
+ * a year of cash-and-carry from +6% to -34%.
+ *
+ * This averages the differential over a warmup window and then enters on the
+ * first bar after it whose sign agrees. Only data before the entry is used, so
+ * the choice stays ex-ante.
+ *
+ * Returns both series trimmed to the chosen entry, or the originals unchanged if
+ * no agreeing bar exists.
+ */
+export function alignEntryToPrevailingFunding(
+  ratesA: FundingRateEntry[],
+  ratesB: FundingRateEntry[],
+  warmupDays = 7
+): { ratesA: FundingRateEntry[]; ratesB: FundingRateEntry[] } {
+  if (ratesA.length < 48 || ratesB.length < 48) return { ratesA, ratesB };
+
+  const mapB = new Map(ratesB.map((r) => [Math.floor(r.timestamp / HOUR) * HOUR, r.fundingRate]));
+  const start = ratesA[0].timestamp;
+  const warmupEnd = start + warmupDays * 24 * HOUR;
+
+  let sum = 0;
+  let n = 0;
+  for (const a of ratesA) {
+    if (a.timestamp >= warmupEnd) break;
+    const b = mapB.get(Math.floor(a.timestamp / HOUR) * HOUR);
+    if (b === undefined) continue;
+    sum += a.fundingRate - b;
+    n++;
+  }
+  if (n === 0 || sum === 0) return { ratesA, ratesB };
+
+  const prevailing = Math.sign(sum);
+
+  // The engine's main loop starts at index 1, so the matching bar has to land
+  // there — slice from the bar immediately before it, not from the match itself.
+  for (let i = 1; i < ratesA.length; i++) {
+    const a = ratesA[i];
+    if (a.timestamp < warmupEnd) continue;
+    const b = mapB.get(Math.floor(a.timestamp / HOUR) * HOUR);
+    if (b === undefined) continue;
+    const diff = a.fundingRate - b;
+    if (diff !== 0 && Math.sign(diff) === prevailing) {
+      const from = ratesA[i - 1].timestamp;
+      return {
+        ratesA: ratesA.filter((r) => r.timestamp >= from),
+        ratesB: ratesB.filter((r) => r.timestamp >= from),
+      };
+    }
+  }
+
+  return { ratesA, ratesB };
+}
+
 /** Total funding accrued over the series (sum of per-event rates). */
 export function totalFunding(rates: FundingRateEntry[]): number {
   return rates.reduce((s, r) => s + r.fundingRate, 0);

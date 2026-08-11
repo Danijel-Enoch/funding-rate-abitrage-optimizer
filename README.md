@@ -108,20 +108,29 @@ bun run stocks TSLA --hl-map TSLA:TSLAUSD   # Manual HL ticker override
 
 **Supported stocks:** TSLA, NVDA, AAPL, MSFT, GOOGL, AMZN, META, NFLX, AMD, MU, INTC, AVGO, ARM, TSM, CRWV, ORCL, COIN, MSTR, HOOD, PLTR, SPCX, SPY, QQQ
 
-### Strategy Comparison (Perp vs Perp / Spot / Options)
+### Strategy Comparison (Perp vs Perp / Spot / Options / Options vs Options)
 
-One-year head-to-head backtest of the three delta-neutral carry structures on BTC and ETH.
+Head-to-head backtest of the four delta-neutral carry structures across multiple
+lookback windows.
 
 ```bash
-bun run compare                             # BTC + ETH, 365d, $50k, 1x notional
+bun run compare                             # BTC+ETH+SOL, 90/180/365d, $50k, 1x
 bun run compare BTC --days 365
+bun run compare BTC ETH SOL --days 90,180,365 --capital 500
 bun run compare BTC ETH --capital 100000 --notional 2
 bun run compare --no-cache                  # bypass the .cache/ data cache
 bun run compare --json                      # also write .cache/compare-results.json
 ```
 
-`--notional` sets position notional as a multiple of capital and is applied to **all three**
-strategies, so returns are comparable. Raw API pulls are cached under `.cache/`.
+`--days` accepts a comma-separated list; data is fetched once at the longest window
+and sliced, so a 3-window sweep costs one set of API pulls.
+
+`--notional` sets position notional as a multiple of capital and is applied to **all
+four** strategies, so returns are comparable.
+
+Output includes a cross-period APY matrix, the same figures as monthly compounded
+return, an executability check against each venue's minimum order size, and a target
+check showing the leverage a given monthly return would require.
 
 ### Options Conversion Arbitrage (Live)
 
@@ -201,8 +210,14 @@ Only two venues in this repo have a real options order book. Both are integrated
 
 | Exchange | Settlement | Option Fee | Historical IV | Notes |
 |----------|-----------|------------|---------------|-------|
-| Deribit | Inverse (coin-margined) | 3 bps of underlying, capped at 12.5% of premium | DVOL index, 1y+ | Deepest crypto options book |
-| Paradex | USDC | 1 bp, capped at 12.5% of premium | none published | Live chain with exchange-computed greeks |
+| Deribit | Inverse (coin-margined) | 3 bps of underlying, capped at 12.5% of premium | DVOL index, 1y+ | Deepest book. Min order 0.1 BTC / 1 ETH |
+| Paradex | USDC | 1 bp, capped at 12.5% of premium | none published | Live chain with greeks. Min notional $20 |
+
+Neither venue lists SOL options, so SOL runs the perp strategies only.
+
+The Deribit minimum order size matters for small accounts: 0.1 BTC is roughly
+$6,400 of notional and 1 ETH roughly $1,900, so an account of a few hundred dollars
+can only trade options on Paradex. `bun run compare` reports this explicitly.
 
 ## Strategies
 
@@ -212,8 +227,17 @@ Only two venues in this repo have a real options order book. Both are integrated
   the perp hedge leg still pays/earns funding
 - Implied leg uses Deribit DVOL (DVOL² is the fair strike of a 30d variance swap)
 - P&L decomposes into theta/gamma, vega, funding on the hedge, and fees
-- A separate conversion-arb variant (`options-arb`) trades the put-call-parity
-  forward against the perp mark
+- Uncapped tails — a large gap move is the main risk
+
+### Options vs Options
+- Iron fly: the same short ATM straddle with a long OTM strangle bought against it
+- The long wings cap the tail at the cost of part of the premium, so it earns less
+  than the naked straddle but with a materially smaller worst-case trade
+- Wing width is swept in standardized moneyness (0.75σ to 2.0σ)
+- Wing vols come from a smile fitted to a live Deribit chain and held constant in
+  shape while its level scales with DVOL — the absolute numbers are smile-dependent
+- A cross-venue variant (`options-arb`) compares matched strikes on Deribit vs
+  Paradex; that one is live-only, since neither venue publishes historical chains
 
 ### Spot vs Perp
 - Long spot + Short perp (collect funding when perp premium)

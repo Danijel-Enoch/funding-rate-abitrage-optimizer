@@ -116,6 +116,22 @@ export interface BacktestConfig {
   openInterestDataB: Array<{ timestamp: number; openInterest: number }>; // OI for venue B
   // BasisOS: coin identifier for risk-adjusted leverage
   coin: string;
+  /**
+   * Treat the two legs as one cross-margined book (default) instead of two
+   * isolated positions.
+   *
+   * Every strategy here is delta-neutral, so a large directional move produces a
+   * big loss on one leg and an equal gain on the other. Checking each leg in
+   * isolation liquidates the losing side and charges its loss, while the price
+   * P&L across the pair has already netted to zero — double-counting a move the
+   * hedge neutralised. A 46% BTC drawdown, for example, showed up as a phantom
+   * -$20k liquidation on a position whose net exposure was flat.
+   *
+   * With netting on, liquidation fires only when the *combined* mark-to-market
+   * loss exceeds posted margin, which is the real risk: the two venues' prices
+   * diverging, not the market moving.
+   */
+  crossMarginLegs: boolean;
 }
 
 export interface Trade {
@@ -585,6 +601,7 @@ function getConfig(config: Partial<BacktestConfig>): BacktestConfig {
     openInterestData: config.openInterestData ?? [],
     openInterestDataB: config.openInterestDataB ?? [],
     coin: config.coin ?? "",
+    crossMarginLegs: config.crossMarginLegs ?? true,
   };
 }
 
@@ -852,6 +869,44 @@ export function runBacktest(
         const currentPriceA = getPrice("A", cur.timestamp);
         const currentPriceB = getPrice("B", cur.timestamp);
 
+        // Cross-margined: liquidate on the combined loss, not leg by leg
+        if (cfg.crossMarginLegs) {
+          if (currentPriceA !== null && currentPriceB !== null && !openTrade.liquidated) {
+            const isLongA = openTrade.direction === "long_a_short_b";
+            const retA = isLongA
+              ? (currentPriceA - openTrade.entryPriceA) / openTrade.entryPriceA
+              : (openTrade.entryPriceA - currentPriceA) / openTrade.entryPriceA;
+            const retB = isLongA
+              ? (openTrade.entryPriceB - currentPriceB) / openTrade.entryPriceB
+              : (currentPriceB - openTrade.entryPriceB) / openTrade.entryPriceB;
+
+            const netPnl = openTrade.notionalA * retA + openTrade.notionalB * retB;
+            const postedMargin = openTrade.notionalA / leverageA + openTrade.notionalB / leverageB;
+            const mmBuffer = (openTrade.notionalA + openTrade.notionalB) * (cfg.maintenanceMarginBps / 10000);
+
+            if (netPnl < -(postedMargin - mmBuffer)) {
+              const loss = Math.min(-netPnl, postedMargin);
+              openTrade.liquidated = true;
+              openTrade.liquidatedAt = new Date(cur.timestamp);
+              openTrade.liquidatedLeg = "A";
+              openTrade.liquidationLoss = loss;
+              openTrade.pnl -= loss;
+              totalLiquidationLoss += loss;
+              liquidationEvents.push({
+                timestamp: cur.timestamp,
+                leg: "A",
+                entryPrice: openTrade.entryPriceA,
+                liquidationPrice: currentPriceA,
+                priceMove: (netPnl / (openTrade.notionalA + openTrade.notionalB)) * 100,
+                leverage: leverageA,
+                notional: openTrade.notionalA + openTrade.notionalB,
+                loss,
+                strategy: `${cfg.venueA} vs ${cfg.venueB} (cross-margined)`,
+              });
+            }
+          }
+        } else {
+
         // Check leg A
         if (currentPriceA !== null) {
           const isLongA = openTrade.direction === "long_a_short_b";
@@ -906,6 +961,7 @@ export function runBacktest(
               strategy: `${cfg.venueA} vs ${cfg.venueB}`,
             });
           }
+        }
         }
       }
 

@@ -1,35 +1,68 @@
 /**
- * Perp vs Options backtest engine
+ * Options backtest engine — perp_vs_options and options_vs_options
  *
- * Strategy: sell an ATM straddle on the options venue (Deribit / Paradex) and
- * delta-hedge it with the perp on the same venue. This is the options analogue
- * of a funding carry trade — instead of harvesting the perp/spot funding spread,
- * it harvests the variance risk premium (implied vol sold above realized vol),
- * while the perp hedge leg still accrues real funding.
+ * Both strategies are delta-neutral short-volatility structures built from the
+ * same leg machinery:
  *
- * P&L is decomposed hourly into four terms:
- *   1. Theta/gamma:  0.5 · Γ$ · (σ_impl² · dt − r²)   — short vol earns the
- *                    implied variance and pays the realized variance.
- *   2. Vega:         −Vega$ · Δσ_impl                 — mark-to-market on IV moves.
- *   3. Funding:      −hedgeNotional · fundingRate     — the perp leg's carry.
- *   4. Costs:        option fees, perp hedge fees, IV bid-ask, perp spread.
+ *   short_straddle (perp_vs_options)
+ *     Sell an ATM call + ATM put, delta-hedge with the perp. Harvests the full
+ *     variance risk premium with uncapped tails.
  *
- * Data sources (all real, all publicly retrievable for a full year):
- *   - σ_impl : Deribit DVOL, the VIX-style 30-day implied vol index. DVOL² is the
- *              fair strike of a 30-day variance swap, which is exactly the implied
- *              leg being sold here.
+ *   iron_fly (options_vs_options)
+ *     Sell the ATM straddle and buy an OTM strangle against it. The long wings
+ *     cap the tail at the cost of part of the premium — an options-vs-options
+ *     structure whose P&L is the spread between ATM and wing volatility.
+ *
+ * P&L is accumulated hourly, per leg, at that leg's own implied vol:
+ *   1. Theta/gamma:  qty · 0.5 · Γ · S² · (r² − σ_leg² · dt)
+ *   2. Vega:         qty · Vega · Δσ_leg
+ *   3. Funding:      −hedgeNotional · fundingRate   (the perp delta hedge)
+ *   4. Costs:        per-leg option fees, perp hedge fees, IV and perp spreads
+ *
+ * Data (all real, all publicly retrievable for a full year):
+ *   - σ_atm  : Deribit DVOL, the VIX-style 30-day implied vol index. DVOL² is
+ *              the fair strike of a 30-day variance swap.
  *   - r      : hourly log returns of the perp mark.
  *   - funding: hourly perp funding.
  *
- * Known simplification: DVOL is a constant-maturity 30-day index, while the
- * straddle held has a decaying tenor. The position is therefore rolled at
- * `rollAtDaysRemaining` so its tenor stays in a band where DVOL is a good proxy,
- * rather than being held into the last days where the short-dated smile diverges.
+ * Assumption to be aware of: DVOL gives the ATM level only, so wing vols come
+ * from a fixed smile (see SMILE) fitted to a live Deribit chain and held
+ * constant in shape while its level scales with DVOL. That is only material for
+ * iron_fly, whose edge *is* the ATM-to-wing spread — treat its absolute numbers
+ * as smile-dependent. short_straddle uses ATM vol only and does not rely on it.
  */
 
 import type { FundingRateEntry } from "./exchanges/types";
 import type { DvolEntry } from "./exchanges/deribit";
-import { straddleGreeks, YEAR_MS } from "./options";
+import { blackScholes, YEAR_MS } from "./options";
+
+export type OptionStructure = "short_straddle" | "iron_fly";
+
+/**
+ * Volatility smile as a ratio to ATM vol, quadratic in standardized moneyness
+ * m = ln(K/F) / (σ_atm · √T):
+ *
+ *     σ(m) / σ_atm = 1 + skew · m + curvature · m²
+ *
+ * Fitted to live Deribit 30-day chains: both coins show the usual put skew
+ * (downside vol rich) with an upside smile. Refit with `bun run smile`.
+ */
+export interface SmileParams {
+  skew: number;
+  curvature: number;
+}
+
+export const SMILE: Record<string, SmileParams> = {
+  BTC: { skew: -0.086, curvature: 0.045 },
+  ETH: { skew: -0.046, curvature: 0.055 },
+};
+
+export const DEFAULT_SMILE: SmileParams = { skew: -0.07, curvature: 0.05 };
+
+/** Vol multiplier vs ATM at standardized moneyness m. Floored to stay positive. */
+export function smileRatio(m: number, p: SmileParams): number {
+  return Math.max(1 + p.skew * m + p.curvature * m * m, 0.25);
+}
 
 export interface OptionsFeeModel {
   /** Option trading fee as bps of *underlying* notional (Deribit: 3bps per leg). */
@@ -47,8 +80,8 @@ export interface OptionsFeeModel {
 export const OPTIONS_FEES: Record<string, OptionsFeeModel> = {
   // Deribit: options 0.03% of underlying capped at 12.5% of premium; perp taker 0.05%
   deribit: { optionFeeBps: 3.0, optionFeeCapPctPremium: 0.125, ivHalfSpreadVolPts: 1.0, perpFeeBps: 5.0, perpHalfSpreadBps: 0.5 },
-  // Paradex: options 1bp of premium-based notional, capped 12.5%; perp taker ~3bps.
-  // Wider IV spread reflects thinner books than Deribit.
+  // Paradex: options 1bp, capped 12.5%; perp taker ~3bps. Wider IV spread
+  // reflects thinner books than Deribit.
   paradex: { optionFeeBps: 1.0, optionFeeCapPctPremium: 0.125, ivHalfSpreadVolPts: 2.5, perpFeeBps: 3.0, perpHalfSpreadBps: 1.5 },
 };
 
@@ -56,16 +89,20 @@ export interface OptionsBacktestConfig {
   initialCapital: number;
   coin: string;
   venue: string;
+  structure: OptionStructure;
   /** Straddle tenor at inception, in days. 30 matches the DVOL index tenor. */
   tenorDays: number;
   /** Roll the position once it has this many days left. */
   rollAtDaysRemaining: number;
-  /** Straddle notional as a multiple of capital (margin utilisation). */
+  /** ATM straddle notional as a multiple of capital. */
   notionalLeverage: number;
+  /** Wing distance for iron_fly, in standardized moneyness (1.0 ≈ a 1σ move). */
+  wingWidth: number;
   /** Rehedge when |portfolio delta| exceeds this fraction of straddle notional. */
   deltaBand: number;
   /** Close the position if unrealised loss exceeds this fraction of capital. */
   stopLossPct: number;
+  smile: SmileParams;
   fees: OptionsFeeModel;
 }
 
@@ -95,7 +132,7 @@ export interface OptionsBacktestResult {
   /** Sum of the implied-variance (theta) minus realized-variance (gamma) term. */
   totalThetaGammaPnl: number;
   totalVegaPnl: number;
-  /** Funding earned/paid on the perp delta hedge — the "perp" side of perp vs options. */
+  /** Funding earned/paid on the perp delta hedge. */
   totalFundingPnl: number;
   winRate: number;
   totalTrades: number;
@@ -111,21 +148,27 @@ export interface OptionsBacktestResult {
   stopOuts: number;
   pnlHistory: number[];
   timestamps: number[];
-  /** Fraction of hours the perp hedge was net long (pays funding when rates are positive). */
+  /** Fraction of hours the perp hedge was net long. */
   hedgeLongFraction: number;
+  /** Worst single-trade loss, as a fraction of capital — the tail the wings cap. */
+  worstTradePct: number;
 }
 
 export function defaultOptionsConfig(partial: Partial<OptionsBacktestConfig> = {}): OptionsBacktestConfig {
   const venue = partial.venue ?? "deribit";
+  const coin = partial.coin ?? "BTC";
   return {
     initialCapital: partial.initialCapital ?? 50000,
-    coin: partial.coin ?? "BTC",
+    coin,
     venue,
+    structure: partial.structure ?? "short_straddle",
     tenorDays: partial.tenorDays ?? 30,
     rollAtDaysRemaining: partial.rollAtDaysRemaining ?? 15,
     notionalLeverage: partial.notionalLeverage ?? 2.0,
+    wingWidth: partial.wingWidth ?? 1.0,
     deltaBand: partial.deltaBand ?? 0.05,
     stopLossPct: partial.stopLossPct ?? 0.5,
+    smile: partial.smile ?? SMILE[coin] ?? DEFAULT_SMILE,
     fees: partial.fees ?? OPTIONS_FEES[venue] ?? OPTIONS_FEES.deribit,
   };
 }
@@ -133,7 +176,7 @@ export function defaultOptionsConfig(partial: Partial<OptionsBacktestConfig> = {
 interface HourlyRow {
   timestamp: number;
   price: number;
-  iv: number;          // annualized decimal
+  iv: number;          // annualized decimal, ATM
   fundingRate: number; // per hour
 }
 
@@ -165,19 +208,28 @@ export function buildHourlyGrid(
   }
 
   rows.sort((a, b) => a.timestamp - b.timestamp);
-  // De-duplicate hours
   return rows.filter((r, i) => i === 0 || r.timestamp !== rows[i - 1].timestamp);
 }
 
-/** Live state of the short straddle plus its perp delta hedge. */
+/** One option leg. qty is signed: positive long, negative short, in contracts. */
+interface Leg {
+  type: "C" | "P";
+  strike: number;
+  qty: number;
+  /** Standardized moneyness fixed at entry; sets this leg's vol via the smile. */
+  m: number;
+}
+
+/** Live state of the option structure plus its perp delta hedge. */
 interface OpenPosition {
   entryTime: number;
-  strike: number;
+  strike: number;          // ATM strike, for reporting
   expiry: number;
   entryIv: number;
   contracts: number;
   straddleNotional: number;
-  hedgeUnits: number;       // signed perp position in coins (+ = long)
+  legs: Leg[];
+  hedgeUnits: number;      // signed perp position in coins (+ = long)
   thetaGamma: number;
   vega: number;
   funding: number;
@@ -191,8 +243,7 @@ export function runOptionsBacktest(
   config: Partial<OptionsBacktestConfig> = {}
 ): OptionsBacktestResult {
   const cfg = defaultOptionsConfig(config);
-  const empty = emptyResult();
-  if (rows.length < 48) return empty;
+  if (rows.length < 48) return emptyResult();
 
   const dt = 1 / (365 * 24); // one hour in years
   const trades: OptionsTrade[] = [];
@@ -206,15 +257,39 @@ export function runOptionsBacktest(
   let hedgeLongHours = 0;
   let hedgedHours = 0;
 
-  // Open position state
   let open: OpenPosition | null = null;
-
   const fees = cfg.fees;
 
+  const legIv = (atmIv: number, m: number) => Math.max(atmIv * smileRatio(m, cfg.smile), 0.01);
+
   /** Deribit-style option fee: bps of underlying, capped at a % of premium. */
-  const optionLegFee = (underlyingNotional: number, premium: number) => {
-    const raw = (underlyingNotional * fees.optionFeeBps) / 10000;
-    return Math.min(raw, premium * fees.optionFeeCapPctPremium);
+  const optionLegFee = (underlyingNotional: number, premium: number) =>
+    Math.min((underlyingNotional * fees.optionFeeBps) / 10000, Math.abs(premium) * fees.optionFeeCapPctPremium);
+
+  /** Total entry/exit cost of trading the whole structure once. */
+  const structureFee = (legs: Leg[], S: number, T: number, atmIv: number) => {
+    let total = 0;
+    for (const leg of legs) {
+      const iv = legIv(atmIv, leg.m);
+      const g = blackScholes(S, leg.strike, T, iv, leg.type);
+      total += optionLegFee(Math.abs(leg.qty) * S, g.price * Math.abs(leg.qty));
+    }
+    return total;
+  };
+
+  const buildLegs = (S: number, T: number, atmIv: number, n: number): Leg[] => {
+    const legs: Leg[] = [
+      { type: "C", strike: S, qty: -n, m: 0 },
+      { type: "P", strike: S, qty: -n, m: 0 },
+    ];
+    if (cfg.structure === "iron_fly") {
+      // Wings placed at ±wingWidth standard deviations of the move to expiry
+      const sd = atmIv * Math.sqrt(T);
+      const w = cfg.wingWidth;
+      legs.push({ type: "C", strike: S * Math.exp(w * sd), qty: n, m: w });
+      legs.push({ type: "P", strike: S * Math.exp(-w * sd), qty: n, m: -w });
+    }
+    return legs;
   };
 
   const openPosition = (i: number) => {
@@ -222,33 +297,33 @@ export function runOptionsBacktest(
     const S = row.price;
     const straddleNotional = cfg.initialCapital * cfg.notionalLeverage;
     const contracts = straddleNotional / S;
-    const K = S; // ATM
     const expiry = row.timestamp + cfg.tenorDays * 86400000;
     const T = cfg.tenorDays / 365;
 
-    // Selling vol: we lift the bid, i.e. we sell at IV minus the half-spread
+    // We sell the ATM straddle at the bid and buy any wings at the offer
     const entryIv = Math.max(row.iv - fees.ivHalfSpreadVolPts / 100, 0.01);
+    const legs = buildLegs(S, T, entryIv, contracts);
 
-    const g = straddleGreeks(S, K, T, entryIv);
-    const premium = g.price * contracts;
+    const entryFee = structureFee(legs, S, T, entryIv);
 
-    // Two legs (call + put), each charged on underlying notional and capped on its own premium
-    const entryFee = 2 * optionLegFee(straddleNotional, premium / 2);
-
-    // Initial delta hedge: short straddle delta is -(straddle delta), hedge is the negative of that
-    const hedgeUnits = g.delta * contracts;
-    const hedgeFee =
-      (Math.abs(hedgeUnits) * S * (fees.perpFeeBps + fees.perpHalfSpreadBps)) / 10000;
+    // Delta-neutralise: perp position offsets the option delta
+    let optDelta = 0;
+    for (const leg of legs) {
+      optDelta += leg.qty * blackScholes(S, leg.strike, T, legIv(entryIv, leg.m), leg.type).delta;
+    }
+    const hedgeUnits = -optDelta;
+    const hedgeFee = (Math.abs(hedgeUnits) * S * (fees.perpFeeBps + fees.perpHalfSpreadBps)) / 10000;
 
     totalFees += entryFee + hedgeFee;
 
     open = {
       entryTime: row.timestamp,
-      strike: K,
+      strike: S,
       expiry,
       entryIv,
       contracts,
       straddleNotional,
+      legs,
       hedgeUnits,
       thetaGamma: 0,
       vega: 0,
@@ -265,23 +340,19 @@ export function runOptionsBacktest(
     const S = row.price;
     const T = Math.max((open.expiry - row.timestamp) / YEAR_MS, 0);
 
-    // Buying back vol: we pay the offer, i.e. IV plus the half-spread
+    // Buying the structure back: pay the offer on the shorts
     const exitIv = row.iv + fees.ivHalfSpreadVolPts / 100;
-    const g = straddleGreeks(S, open.strike, T, exitIv);
-    const premium = Math.max(g.price * open.contracts, 0);
-
-    const exitFee = 2 * optionLegFee(open.straddleNotional, premium / 2);
-    const hedgeExitFee =
-      (Math.abs(open.hedgeUnits) * S * (fees.perpFeeBps + fees.perpHalfSpreadBps)) / 10000;
+    const exitFee = structureFee(open.legs, S, T, exitIv);
+    const hedgeExitFee = (Math.abs(open.hedgeUnits) * S * (fees.perpFeeBps + fees.perpHalfSpreadBps)) / 10000;
 
     open.fees += exitFee + hedgeExitFee;
     totalFees += exitFee + hedgeExitFee;
 
     // Realized vol over the life of the trade, for reporting
-    const window = rows.slice(open.entryPriceIdx, i + 1).map((r) => r.price);
+    const window = rows.slice(open.entryPriceIdx, i + 1);
     let sumSq = 0;
     for (let k = 1; k < window.length; k++) {
-      const lr = Math.log(window[k] / window[k - 1]);
+      const lr = Math.log(window[k].price / window[k - 1].price);
       sumSq += lr * lr;
     }
     const rv = window.length > 1 ? Math.sqrt((sumSq / (window.length - 1)) * 365 * 24) : 0;
@@ -317,6 +388,9 @@ export function runOptionsBacktest(
   let rvSumSq = 0;
   let rvCount = 0;
 
+  const hasRunway = (ts: number) =>
+    rows[rows.length - 1].timestamp - ts > cfg.tenorDays * 86400000 * 0.25;
+
   for (let i = 1; i < rows.length; i++) {
     const prev = rows[i - 1];
     const row = rows[i];
@@ -327,10 +401,7 @@ export function runOptionsBacktest(
     rvCount++;
 
     if (!open) {
-      // Need enough runway left in the data to hold a position
-      if (rows[rows.length - 1].timestamp - row.timestamp > cfg.tenorDays * 86400000 * 0.25) {
-        openPosition(i);
-      }
+      if (hasRunway(row.timestamp)) openPosition(i);
       pnlHistory.push(realizedPnl);
       timestamps.push(row.timestamp);
       continue;
@@ -341,20 +412,24 @@ export function runOptionsBacktest(
 
     const S = row.price;
     const T = Math.max((pos.expiry - row.timestamp) / YEAR_MS, 1 / 365 / 24);
-    const g = straddleGreeks(S, pos.strike, T, row.iv);
 
-    // 1. Theta/gamma: short vol collects implied variance, pays realized variance
-    const dollarGamma = g.gamma * S * S * pos.contracts;
-    const thetaGammaStep = 0.5 * dollarGamma * (row.iv * row.iv * dt - logRet * logRet);
-    pos.thetaGamma += thetaGammaStep;
+    let optDelta = 0;
+    for (const leg of pos.legs) {
+      const ivNow = legIv(row.iv, leg.m);
+      const ivPrev = legIv(prev.iv, leg.m);
+      const g = blackScholes(S, leg.strike, T, ivNow, leg.type);
 
-    // 2. Vega: short vega loses when implied vol rises
-    const vegaStep = -g.vega * pos.contracts * (row.iv - prev.iv);
-    pos.vega += vegaStep;
+      optDelta += leg.qty * g.delta;
+
+      // 1. Theta/gamma — long gamma pays for realized variance, short collects implied
+      pos.thetaGamma += leg.qty * 0.5 * g.gamma * S * S * (logRet * logRet - ivNow * ivNow * dt);
+
+      // 2. Vega — long vega gains when implied vol rises
+      pos.vega += leg.qty * g.vega * (ivNow - ivPrev);
+    }
 
     // 3. Funding on the perp delta hedge. Long perp pays when funding is positive.
-    const hedgeNotional = pos.hedgeUnits * S;
-    pos.funding += -hedgeNotional * row.fundingRate;
+    pos.funding += -(pos.hedgeUnits * S) * row.fundingRate;
 
     if (pos.hedgeUnits !== 0) {
       hedgedHours++;
@@ -362,7 +437,7 @@ export function runOptionsBacktest(
     }
 
     // 4. Rehedge when the portfolio delta drifts outside the band
-    const targetHedge = g.delta * pos.contracts;
+    const targetHedge = -optDelta;
     const driftNotional = Math.abs(targetHedge - pos.hedgeUnits) * S;
     if (driftNotional > cfg.deltaBand * pos.straddleNotional) {
       const cost = (driftNotional * (fees.perpFeeBps + fees.perpHalfSpreadBps)) / 10000;
@@ -376,19 +451,15 @@ export function runOptionsBacktest(
     pnlHistory.push(realizedPnl + unrealized);
     timestamps.push(row.timestamp);
 
-    // Stop out on a margin-threatening loss
     if (unrealized < -cfg.stopLossPct * cfg.initialCapital) {
       closePosition(i, true);
       continue;
     }
 
-    // Roll when the tenor decays past the roll point
     const daysRemaining = (pos.expiry - row.timestamp) / 86400000;
     if (daysRemaining <= cfg.rollAtDaysRemaining) {
       closePosition(i, false);
-      if (rows[rows.length - 1].timestamp - row.timestamp > cfg.tenorDays * 86400000 * 0.25) {
-        openPosition(i);
-      }
+      if (hasRunway(row.timestamp)) openPosition(i);
     }
   }
 
@@ -416,8 +487,7 @@ export function runOptionsBacktest(
     Math.sqrt(returns.reduce((s, r) => s + (r - avgRet) ** 2, 0) / (returns.length || 1)) || 1e-12;
 
   // Annualize using actual elapsed time, not the sample count
-  const elapsedMs = rows[rows.length - 1].timestamp - rows[0].timestamp;
-  const elapsedDays = elapsedMs / 86400000;
+  const elapsedDays = (rows[rows.length - 1].timestamp - rows[0].timestamp) / 86400000;
   const periodsPerYear = returns.length > 0 ? (returns.length * 365) / Math.max(elapsedDays, 1e-9) : 0;
   const sharpeRatio = (avgRet / std) * Math.sqrt(periodsPerYear);
 
@@ -427,6 +497,7 @@ export function runOptionsBacktest(
 
   const avgImpliedVol = ivSum / (rvCount || 1);
   const avgRealizedVol = Math.sqrt((rvSumSq / (rvCount || 1)) * 365 * 24);
+  const worstTrade = trades.reduce((w, t) => Math.min(w, t.pnl), 0);
 
   return {
     trades,
@@ -449,6 +520,7 @@ export function runOptionsBacktest(
     pnlHistory,
     timestamps,
     hedgeLongFraction: hedgedHours ? hedgeLongHours / hedgedHours : 0,
+    worstTradePct: worstTrade / cfg.initialCapital,
   };
 }
 
@@ -458,6 +530,6 @@ function emptyResult(): OptionsBacktestResult {
     totalFundingPnl: 0, winRate: 0, totalTrades: 0, maxDrawdown: 0, maxDrawdownPct: 0,
     sharpeRatio: 0, annualizedReturn: 0, avgImpliedVol: 0, avgRealizedVol: 0,
     avgVrpVolPts: 0, totalRehedges: 0, stopOuts: 0, pnlHistory: [], timestamps: [],
-    hedgeLongFraction: 0,
+    hedgeLongFraction: 0, worstTradePct: 0,
   };
 }

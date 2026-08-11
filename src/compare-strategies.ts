@@ -28,7 +28,7 @@ import {
 import {
   runOptionsBacktest, buildHourlyGrid, OPTIONS_FEES, type OptionsBacktestResult,
 } from "./backtest-options";
-import { resampleFundingHourly, annualizedFunding } from "./funding-normalize";
+import { resampleFundingHourly, annualizedFunding, alignEntryToPrevailingFunding } from "./funding-normalize";
 import { deribit, hyperliquid, aster, lighterSpot } from "./exchanges/index";
 import type { FundingRateEntry, PerpExchange } from "./exchanges/types";
 import type { DvolEntry } from "./exchanges/deribit";
@@ -69,7 +69,8 @@ const OPTIONS_VENUES = ["deribit", "paradex"];
 // ── CLI ──
 interface Args {
   coins: string[];
-  days: number;
+  /** Lookback windows in days, each run separately (e.g. 90, 180, 365). */
+  periods: number[];
   capital: number;
   leverage: number;
   /** Position notional as a multiple of capital, applied to all three strategies. */
@@ -80,11 +81,12 @@ interface Args {
 
 function parseArgs(argv: string[]): Args {
   const coins: string[] = [];
-  let days = 365, capital = 50000, leverage = 3, notional = 1, useCache = true, json = false;
+  let periods = [90, 180, 365];
+  let capital = 50000, leverage = 3, notional = 1, useCache = true, json = false;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--days") days = parseInt(argv[++i]);
+    if (a === "--days") periods = argv[++i].split(",").map((d) => parseInt(d.trim())).filter((d) => d > 0);
     else if (a === "--capital") capital = parseFloat(argv[++i]);
     else if (a === "--leverage") leverage = parseFloat(argv[++i]);
     else if (a === "--notional") notional = parseFloat(argv[++i]);
@@ -93,7 +95,11 @@ function parseArgs(argv: string[]): Args {
     else if (!a.startsWith("--")) coins.push(a.toUpperCase());
   }
 
-  return { coins: coins.length ? coins : ["BTC", "ETH"], days, capital, leverage, notional, useCache, json };
+  return {
+    coins: coins.length ? coins : ["BTC", "ETH", "SOL"],
+    periods: periods.length ? periods : [365],
+    capital, leverage, notional, useCache, json,
+  };
 }
 
 // ── Disk cache (API pulls are slow and rate-limited) ──
@@ -120,6 +126,31 @@ interface CoinData {
   prices: Map<string, Array<{ timestamp: number; price: number }>>;
   spotPrices: Array<{ timestamp: number; price: number }>;
   dvol: DvolEntry[];
+}
+
+/**
+ * Fetches at `maxDays` and slices shorter windows out of the same series, so a
+ * 90/180/365 sweep costs one set of API pulls rather than three.
+ */
+function sliceCoinData(data: CoinData, days: number): CoinData {
+  const cutoff = Date.now() - days * 86400000;
+  const after = <T extends { timestamp: number }>(xs: T[]) => xs.filter((x) => x.timestamp >= cutoff);
+
+  const funding = new Map<string, FundingRateEntry[]>();
+  for (const [v, r] of data.funding) {
+    const sliced = after(r);
+    if (sliced.length > 24) funding.set(v, sliced);
+  }
+  const prices = new Map<string, Array<{ timestamp: number; price: number }>>();
+  for (const [v, p] of data.prices) prices.set(v, after(p));
+
+  return {
+    coin: data.coin,
+    funding,
+    prices,
+    spotPrices: after(data.spotPrices),
+    dvol: after(data.dvol),
+  };
 }
 
 async function loadCoinData(coin: string, days: number, useCache: boolean): Promise<CoinData> {
@@ -167,7 +198,7 @@ async function loadCoinData(coin: string, days: number, useCache: boolean): Prom
 // ── Strategy runs ──
 interface StrategyRun {
   coin: string;
-  strategy: "perp_vs_perp" | "spot_vs_perp" | "perp_vs_options";
+  strategy: "perp_vs_perp" | "spot_vs_perp" | "perp_vs_options" | "options_vs_options";
   label: string;
   apy: number;
   sharpe: number;
@@ -203,10 +234,11 @@ function toRun(
 }
 
 function optionsToRun(
-  coin: string, label: string, r: OptionsBacktestResult, note?: string
+  coin: string, strategy: StrategyRun["strategy"], label: string,
+  r: OptionsBacktestResult, note?: string
 ): StrategyRun {
   return {
-    coin, strategy: "perp_vs_options", label,
+    coin, strategy, label,
     apy: r.annualizedReturn,
     sharpe: r.sharpeRatio,
     maxDdPct: r.maxDrawdownPct,
@@ -288,8 +320,10 @@ function runPerpVsPerp(data: CoinData, capital: number, notionalMult: number): S
   for (const a of venues) {
     for (const b of venues) {
       if (a === b) continue;
-      const ratesA = data.funding.get(a)!;
-      const ratesB = data.funding.get(b)!;
+      // Entry direction must come from the prevailing regime, not one noisy bar
+      const { ratesA, ratesB } = alignEntryToPrevailingFunding(
+        data.funding.get(a)!, data.funding.get(b)!
+      );
       const priceA = data.prices.get(a) ?? data.spotPrices;
       const priceB = data.prices.get(b) ?? data.spotPrices;
 
@@ -314,9 +348,10 @@ function runPerpVsPerp(data: CoinData, capital: number, notionalMult: number): S
 function runSpotVsPerp(data: CoinData, capital: number, notionalMult: number): StrategyRun[] {
   const runs: StrategyRun[] = [];
 
-  for (const [venue, ratesB] of data.funding) {
+  for (const [venue, rawB] of data.funding) {
     // Spot leg pays no funding
-    const ratesA = ratesB.map((r) => ({ ...r, fundingRate: 0, coin: "spot" }));
+    const rawA = rawB.map((r) => ({ ...r, fundingRate: 0, coin: "spot" }));
+    const { ratesA, ratesB } = alignEntryToPrevailingFunding(rawA, rawB);
     const priceB = data.prices.get(venue) ?? data.spotPrices;
 
     const swept = sweep((fundingThreshold, useMakerFees) =>
@@ -337,7 +372,19 @@ function runSpotVsPerp(data: CoinData, capital: number, notionalMult: number): S
   return runs;
 }
 
-function runPerpVsOptions(data: CoinData, capital: number, notionalMult: number): StrategyRun[] {
+/**
+ * Both options structures share the same engine and the same hourly grid; they
+ * differ only in the legs traded.
+ *
+ *   perp_vs_options     short ATM straddle, delta-hedged with the perp
+ *   options_vs_options  iron fly — the same short straddle with a long OTM
+ *                       strangle bought against it, capping the tail
+ *
+ * Coins without an options market (SOL has none on either venue) return nothing.
+ */
+function runOptionsStrategies(
+  data: CoinData, capital: number, notionalMult: number
+): StrategyRun[] {
   const runs: StrategyRun[] = [];
   const funding = data.funding.get("deribit");
   const prices = data.prices.get("deribit");
@@ -346,19 +393,33 @@ function runPerpVsOptions(data: CoinData, capital: number, notionalMult: number)
   const grid = buildHourlyGrid(prices, data.dvol, funding);
   if (grid.length < 48) return runs;
 
+  const paradexNote = "Paradex fee model on Deribit IV/funding (no Paradex vol history)";
+
   for (const venue of OPTIONS_VENUES) {
-    const result = runOptionsBacktest(grid, {
-      initialCapital: capital,
-      coin: data.coin,
-      venue,
-      notionalLeverage: notionalMult,
+    const straddle = runOptionsBacktest(grid, {
+      initialCapital: capital, coin: data.coin, venue,
+      structure: "short_straddle", notionalLeverage: notionalMult,
       fees: OPTIONS_FEES[venue],
     });
-    if (result.totalTrades > 0) {
-      const note = venue === "paradex"
-        ? "Paradex fee model applied to Deribit IV/funding (no Paradex vol history)"
-        : undefined;
-      runs.push(optionsToRun(data.coin, `short straddle @ ${venue}`, result, note));
+    if (straddle.totalTrades > 0) {
+      runs.push(optionsToRun(data.coin, "perp_vs_options", `short straddle @ ${venue}`,
+        straddle, venue === "paradex" ? paradexNote : undefined));
+    }
+
+    // Wing width is swept: narrow wings cap more tail but cost more premium
+    let bestFly: { r: OptionsBacktestResult; w: number } | null = null;
+    for (const w of [0.75, 1.0, 1.25, 1.5, 2.0]) {
+      const r = runOptionsBacktest(grid, {
+        initialCapital: capital, coin: data.coin, venue,
+        structure: "iron_fly", wingWidth: w, notionalLeverage: notionalMult,
+        fees: OPTIONS_FEES[venue],
+      });
+      if (r.totalTrades === 0) continue;
+      if (!bestFly || r.annualizedReturn > bestFly.r.annualizedReturn) bestFly = { r, w };
+    }
+    if (bestFly) {
+      const note = `${bestFly.w}σ wings` + (venue === "paradex" ? ` · ${paradexNote}` : "");
+      runs.push(optionsToRun(data.coin, "options_vs_options", `iron fly @ ${venue}`, bestFly.r, note));
     }
   }
   return runs;
@@ -456,82 +517,265 @@ function printOptionsDetail(coin: string, r: OptionsBacktestResult) {
   console.log(`  ${C.bold}Net${C.reset}                    ${colorNum(r.totalPnl, usd(r.totalPnl))}   ${C.dim}${r.stopOuts} stop-outs${C.reset}`);
 }
 
+// ── Cross-period summary ──
+
+const STRATEGY_NAMES: Record<string, string> = {
+  perp_vs_perp: "Perp vs Perp",
+  spot_vs_perp: "Perp vs Spot",
+  perp_vs_options: "Perp vs Options",
+  options_vs_options: "Options vs Options",
+};
+const STRATEGY_ORDER: StrategyRun["strategy"][] = [
+  "perp_vs_perp", "spot_vs_perp", "perp_vs_options", "options_vs_options",
+];
+
+interface PeriodResult { days: number; runs: StrategyRun[] }
+
+/** Best run for a coin+strategy in a period, or null if it had no data. */
+function bestOf(runs: StrategyRun[], coin: string, strategy: string): StrategyRun | null {
+  const pool = runs.filter((r) => r.coin === coin && r.strategy === strategy);
+  if (!pool.length) return null;
+  return pool.reduce((a, b) => (b.apy > a.apy ? b : a));
+}
+
+function printMatrix(results: PeriodResult[], coins: string[], capital: number) {
+  console.log(`\n${C.bold}${"═".repeat(100)}${C.reset}`);
+  console.log(`${C.bold}SUMMARY — best APY per strategy, by lookback window${C.reset}`);
+  console.log(`${C.bold}${"═".repeat(100)}${C.reset}`);
+
+  const head = results.map((r) => `${r.days}d`.padStart(11)).join("");
+  console.log(`  ${"Coin".padEnd(6)}${"Strategy".padEnd(21)}${head}   ${"MaxDD (1y)".padStart(11)}`);
+
+  for (const coin of coins) {
+    let printedAny = false;
+    for (const strategy of STRATEGY_ORDER) {
+      const cells = results.map((pr) => bestOf(pr.runs, coin, strategy));
+      if (cells.every((c) => c === null)) continue;
+      printedAny = true;
+
+      const row = cells
+        .map((c) => (c ? colorNum(c.apy, pct(c.apy).padStart(11)) : `${C.dim}${"n/a".padStart(11)}${C.reset}`))
+        .join("");
+      const longest = cells[cells.length - 1];
+      const dd = longest ? pct(longest.maxDdPct).padStart(11) : "".padStart(11);
+
+      console.log(`  ${coin.padEnd(6)}${STRATEGY_NAMES[strategy].padEnd(21)}${row}   ${dd}`);
+    }
+    if (printedAny) console.log("");
+  }
+
+  // Monthly view — what the user actually asked about
+  console.log(`${C.bold}Same numbers as monthly compounded return on $${capital.toLocaleString("en-US")}:${C.reset}`);
+  console.log(`  ${"Coin".padEnd(6)}${"Strategy".padEnd(21)}${results.map((r) => `${r.days}d`.padStart(11)).join("")}`);
+  for (const coin of coins) {
+    for (const strategy of STRATEGY_ORDER) {
+      const cells = results.map((pr) => bestOf(pr.runs, coin, strategy));
+      if (cells.every((c) => c === null)) continue;
+      const row = cells
+        .map((c) => {
+          if (!c) return `${C.dim}${"n/a".padStart(11)}${C.reset}`;
+          const monthly = Math.pow(1 + c.apy, 1 / 12) - 1;
+          return colorNum(monthly, `${(monthly * 100).toFixed(2)}%`.padStart(11));
+        })
+        .join("");
+      console.log(`  ${coin.padEnd(6)}${STRATEGY_NAMES[strategy].padEnd(21)}${row}`);
+    }
+  }
+}
+
+/**
+ * Minimum tradable notional per venue, in USD, from the venues' own contract
+ * specs. Deribit options are the binding constraint for a small account: the
+ * minimum order is 0.1 BTC or 1 ETH, so a few hundred dollars of capital cannot
+ * open the position at all regardless of what the backtest says it returns.
+ */
+const MIN_NOTIONAL_USD: Record<string, number> = {
+  "deribit-option-BTC": 6400,   // 0.1 BTC min_trade_amount
+  "deribit-option-ETH": 1900,   // 1 ETH min_trade_amount
+  "paradex-option": 20,
+  "deribit-perp": 10,
+  "paradex-perp": 10,
+  perp: 10,
+  spot: 10,
+};
+
+/** Smallest notional a strategy needs, given the coin and venue in its label. */
+function minNotionalFor(strategy: string, coin: string, label: string): number {
+  const isOptions = strategy === "perp_vs_options" || strategy === "options_vs_options";
+  if (!isOptions) return MIN_NOTIONAL_USD.perp;
+  if (label.includes("paradex")) return MIN_NOTIONAL_USD["paradex-option"];
+  return MIN_NOTIONAL_USD[`deribit-option-${coin}`] ?? MIN_NOTIONAL_USD["deribit-option-ETH"];
+}
+
+function printExecutability(runs: StrategyRun[], capital: number, notionalMult: number) {
+  const notional = capital * notionalMult;
+  console.log(`\n${C.bold}EXECUTABILITY at $${capital.toLocaleString("en-US")} capital (${notionalMult}x = $${notional.toLocaleString("en-US")} notional)${C.reset}`);
+  console.log(`  ${"Coin".padEnd(6)}${"Strategy".padEnd(21)}${"Venue".padEnd(28)}${"Min notional".padStart(13)}   Status`);
+
+  const seen = new Set<string>();
+  for (const strategy of STRATEGY_ORDER) {
+    for (const r of runs.filter((x) => x.strategy === strategy).sort((a, b) => b.apy - a.apy)) {
+      const k = `${r.coin}:${r.strategy}:${r.label}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      const min = minNotionalFor(r.strategy, r.coin, r.label);
+      const ok = notional >= min;
+      console.log(
+        `  ${r.coin.padEnd(6)}${STRATEGY_NAMES[r.strategy].padEnd(21)}${r.label.slice(0, 27).padEnd(28)}` +
+        `${("$" + min.toLocaleString("en-US")).padStart(13)}   ` +
+        (ok ? `${C.green}tradeable${C.reset}` : `${C.red}below venue minimum — cannot open${C.reset}`)
+      );
+    }
+  }
+}
+
+/** How much notional leverage a strategy would need to hit a monthly target. */
+function printTargetAnalysis(results: PeriodResult[], coins: string[], capital: number, notionalMult: number) {
+  const TARGET_MONTHLY = 0.10;
+  const targetApy = Math.pow(1 + TARGET_MONTHLY, 12) - 1;
+
+  console.log(`\n${C.bold}${"═".repeat(100)}${C.reset}`);
+  console.log(`${C.bold}TARGET CHECK — 10% per month (= ${pct(targetApy)} APY compounded)${C.reset}`);
+  console.log(`${C.bold}${"═".repeat(100)}${C.reset}`);
+
+  const longest = results[results.length - 1];
+  console.log(`  ${"Coin".padEnd(6)}${"Strategy".padEnd(21)}${"APY @" + notionalMult + "x".padStart(10)}` +
+    `${"Needed x".padStart(10)}${"Implied MaxDD".padStart(15)}   Verdict`);
+
+  const rows: Array<{ label: string; needed: number; impliedDd: number }> = [];
+
+  for (const coin of coins) {
+    for (const strategy of STRATEGY_ORDER) {
+      const best = bestOf(longest.runs, coin, strategy);
+      if (!best) continue;
+
+      // Returns scale roughly linearly in notional; so does drawdown.
+      const needed = best.apy > 0 ? (targetApy / best.apy) * notionalMult : Infinity;
+      const impliedDd = best.maxDdPct * (needed / notionalMult);
+
+      let verdict: string;
+      if (!isFinite(needed)) verdict = `${C.red}loses money — no leverage fixes it${C.reset}`;
+      else if (impliedDd >= 1) verdict = `${C.red}account wiped by the drawdown${C.reset}`;
+      else if (needed > 10) verdict = `${C.red}beyond any venue's margin limits${C.reset}`;
+      else verdict = `${C.yellow}possible but ${pct(impliedDd)} drawdown${C.reset}`;
+
+      console.log(`  ${coin.padEnd(6)}${STRATEGY_NAMES[strategy].padEnd(21)}` +
+        `${pct(best.apy).padStart(10)}${(isFinite(needed) ? needed.toFixed(1) + "x" : "—").padStart(10)}` +
+        `${(isFinite(impliedDd) ? pct(impliedDd) : "—").padStart(15)}   ${verdict}`);
+
+      if (isFinite(needed)) rows.push({ label: `${coin} ${STRATEGY_NAMES[strategy]}`, needed, impliedDd });
+    }
+  }
+
+  const feasible = rows.filter((r) => r.needed <= 10 && r.impliedDd < 1).sort((a, b) => a.needed - b.needed);
+  console.log(`\n  ${C.bold}Closest any strategy gets:${C.reset}`);
+  if (!feasible.length) {
+    console.log(`  ${C.red}None. No delta-neutral structure here reaches 10%/month within survivable leverage.${C.reset}`);
+  } else {
+    for (const f of feasible.slice(0, 3)) {
+      console.log(`    ${f.label} — ${f.needed.toFixed(1)}x notional, ${pct(f.impliedDd)} expected max drawdown`);
+    }
+  }
+}
+
 // ── Main ──
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const maxDays = Math.max(...args.periods);
+  const sortedPeriods = [...args.periods].sort((a, b) => a - b);
 
-  console.log(`\n${C.bold}Perp vs Perp  •  Perp vs Spot  •  Perp vs Options${C.reset}`);
-  console.log(`${C.dim}${args.days}-day backtest · $${args.capital.toLocaleString("en-US")} capital · position notional = ${args.notional}x capital on all three strategies${C.reset}`);
+  console.log(`\n${C.bold}Perp vs Perp • Perp vs Spot • Perp vs Options • Options vs Options${C.reset}`);
+  console.log(`${C.dim}Windows: ${sortedPeriods.map((d) => d + "d").join(", ")} · $${args.capital.toLocaleString("en-US")} capital · notional = ${args.notional}x capital on every strategy${C.reset}`);
   console.log(`${C.dim}Perp venues: ${PERP_VENUES.map((v) => v.id).join(", ")} · spot: ${SPOT_VENUE.id} · options: ${OPTIONS_VENUES.join(", ")}${C.reset}`);
   console.log(`${C.dim}Excluded from historical runs:${C.reset}`);
   for (const e of EXCLUDED_FROM_HISTORY) {
     console.log(`${C.dim}  · ${e.id} — ${e.reason}${C.reset}`);
   }
 
-  const all: StrategyRun[] = [];
-  const optionsDetail: Array<{ coin: string; result: OptionsBacktestResult }> = [];
-
+  // Load once at the longest window, then slice
+  const loaded = new Map<string, CoinData>();
   for (const coin of args.coins) {
-    console.log(`\n${C.yellow}Loading ${coin}...${C.reset}`);
-    const data = await loadCoinData(coin, args.days, args.useCache);
-
+    console.log(`\n${C.yellow}Loading ${coin} (${maxDays}d)...${C.reset}`);
+    const data = await loadCoinData(coin, maxDays, args.useCache);
     const covered = [...data.funding.entries()]
-      .map(([v, r]) => `${v} (${(annualizedFunding(r) * 100).toFixed(1)}% avg funding APR)`)
+      .map(([v, r]) => `${v} ${(annualizedFunding(r) * 100).toFixed(1)}%`)
       .join(", ");
-    console.log(`${C.dim}  funding: ${covered || "none"}${C.reset}`);
-    console.log(`${C.dim}  spot prices: ${data.spotPrices.length} pts · DVOL: ${data.dvol.length} pts${C.reset}`);
-
-    if (data.funding.size === 0) {
-      console.log(`${C.red}  no funding data for ${coin}, skipping${C.reset}`);
-      continue;
-    }
-
-    console.log(`\n${C.bold}${C.cyan}══ ${coin} ══${C.reset}`);
-
-    const pvp = runPerpVsPerp(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
-    const svp = runSpotVsPerp(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
-    const pvo = runPerpVsOptions(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
-
-    printRunTable(`${coin} — Perp vs Perp (funding differential)`, pvp);
-    printRunTable(`${coin} — Perp vs Spot (cash and carry)`, svp);
-    printRunTable(`${coin} — Perp vs Options (short vol, delta-hedged)`, pvo);
-
-    // Re-run the Deribit options case to surface its P&L decomposition
-    const funding = data.funding.get("deribit");
-    const prices = data.prices.get("deribit");
-    if (funding?.length && prices?.length && data.dvol.length) {
-      const grid = buildHourlyGrid(prices, data.dvol, funding);
-      const detail = runOptionsBacktest(grid, {
-        initialCapital: args.capital, coin, venue: "deribit",
-        notionalLeverage: args.notional,
-      });
-      if (detail.totalTrades > 0) {
-        printOptionsDetail(coin, detail);
-        optionsDetail.push({ coin, result: detail });
-      }
-    }
-
-    all.push(...pvp, ...svp, ...pvo);
+    console.log(`${C.dim}  funding APR: ${covered || "none"}${C.reset}`);
+    console.log(`${C.dim}  spot prices: ${data.spotPrices.length} · DVOL: ${data.dvol.length}${data.dvol.length ? "" : " (no options market for this coin)"}${C.reset}`);
+    if (data.funding.size > 0) loaded.set(coin, data);
+    else console.log(`${C.red}  no usable funding data, skipping${C.reset}`);
   }
 
-  if (!all.length) {
+  const results: PeriodResult[] = [];
+  const optionsDetail: Array<{ coin: string; days: number; result: OptionsBacktestResult }> = [];
+
+  for (const days of sortedPeriods) {
+    const runs: StrategyRun[] = [];
+    console.log(`\n${C.bold}${C.cyan}${"━".repeat(100)}${C.reset}`);
+    console.log(`${C.bold}${C.cyan}  ${days}-DAY WINDOW${C.reset}`);
+    console.log(`${C.bold}${C.cyan}${"━".repeat(100)}${C.reset}`);
+
+    for (const [coin, full] of loaded) {
+      const data = sliceCoinData(full, days);
+      if (data.funding.size === 0) continue;
+
+      const pvp = runPerpVsPerp(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
+      const svp = runSpotVsPerp(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
+      const opt = runOptionsStrategies(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
+
+      console.log(`\n${C.bold}${C.cyan}══ ${coin} · ${days}d ══${C.reset}`);
+      printRunTable(`Perp vs Perp (funding differential)`, pvp, 3);
+      printRunTable(`Perp vs Spot (cash and carry)`, svp, 3);
+      if (opt.length) {
+        printRunTable(`Options structures (delta-hedged short vol)`, opt, 4);
+      } else {
+        console.log(`\n${C.bold}Options structures${C.reset}\n  ${C.dim}no options market for ${coin} on Deribit or Paradex${C.reset}`);
+      }
+
+      // P&L decomposition on the longest window only, to keep output readable
+      if (days === maxDays) {
+        const funding = data.funding.get("deribit");
+        const prices = data.prices.get("deribit");
+        if (funding?.length && prices?.length && data.dvol.length) {
+          const grid = buildHourlyGrid(prices, data.dvol, funding);
+          const detail = runOptionsBacktest(grid, {
+            initialCapital: args.capital, coin, venue: "deribit",
+            structure: "short_straddle", notionalLeverage: args.notional,
+          });
+          if (detail.totalTrades > 0) {
+            printOptionsDetail(coin, detail);
+            optionsDetail.push({ coin, days, result: detail });
+          }
+        }
+      }
+
+      runs.push(...pvp, ...svp, ...opt);
+    }
+    results.push({ days, runs });
+  }
+
+  const allRuns = results.flatMap((r) => r.runs);
+  if (!allRuns.length) {
     console.log(`\n${C.red}No strategies produced results.${C.reset}`);
     return;
   }
 
-  printVerdict(all, args.capital);
+  const coins = [...loaded.keys()];
+  printMatrix(results, coins, args.capital);
+  printVerdict(results[results.length - 1].runs, args.capital);
+  printExecutability(results[results.length - 1].runs, args.capital, args.notional);
+  printTargetAnalysis(results, coins, args.capital, args.notional);
 
   console.log(`\n${C.dim}Notes:`);
-  console.log(`  · Funding streams are resampled to a common hourly grid, so 8h venues and`);
-  console.log(`    hourly venues are compared on the same basis.`);
-  console.log(`  · Perp vs Options uses Deribit DVOL as the implied leg (DVOL² is the fair`);
-  console.log(`    strike of a 30d variance swap) and real hourly funding on the delta hedge.`);
-  console.log(`  · Paradex serves live option chains and 1y of prices, but its public funding`);
-  console.log(`    endpoint ignores time filters, so it cannot be backtested historically.${C.reset}`);
+  console.log(`  · Funding streams are resampled to a common hourly grid, so 8h and hourly venues compare.`);
+  console.log(`  · Options use Deribit DVOL as the ATM implied leg and real hourly funding on the hedge.`);
+  console.log(`  · Iron fly wing vols come from a fixed smile fitted to a live Deribit chain; its`);
+  console.log(`    absolute numbers are smile-dependent, the short straddle's are not.`);
+  console.log(`  · SOL has no options on Deribit or Paradex, so only the perp strategies run for it.${C.reset}`);
 
   if (args.json) {
     const out = join(CACHE_DIR, "compare-results.json");
-    writeFileSync(out, JSON.stringify({ args, runs: all, optionsDetail }, null, 2));
+    writeFileSync(out, JSON.stringify({ args, results, optionsDetail }, null, 2));
     console.log(`\n${C.dim}Wrote ${out}${C.reset}`);
   }
 }

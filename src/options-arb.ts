@@ -21,7 +21,7 @@
  */
 
 import { deribit, paradexOptions } from "./exchanges/index";
-import { extractSyntheticForwards, findConversionArbs, type ConversionArb } from "./options";
+import { extractSyntheticForwards, findConversionArbs, blackScholes, YEAR_MS, type ConversionArb } from "./options";
 import { EXCHANGE_FEES } from "./backtest";
 import { OPTIONS_FEES } from "./backtest-options";
 
@@ -115,6 +115,100 @@ function printArbs(coin: string, venue: string, arbs: ConversionArb[], minApr: n
   }
 }
 
+/** A strike/expiry quoted on both venues, with the IV difference between them. */
+interface CrossVenueIv {
+  coin: string;
+  expiry: number;
+  strike: number;
+  type: "C" | "P";
+  deribitIv: number;
+  paradexIv: number;
+  /** Positive = Deribit richer, so sell Deribit and buy Paradex. */
+  ivSpreadVolPts: number;
+  vegaPerContract: number;
+}
+
+/**
+ * Options vs options, across venues.
+ *
+ * The same contract quoted on two books rarely carries the same implied vol.
+ * Selling the richer one against the cheaper one is delta-neutral once the
+ * residual delta is hedged, and unlike the single-venue structures it does not
+ * depend on realized vol at all — it only needs the spread to converge.
+ *
+ * This is live-only: neither venue publishes historical chains, so it cannot be
+ * backtested the way the single-venue short-vol strategies can.
+ */
+async function scanCrossVenueIv(coin: string): Promise<CrossVenueIv[]> {
+  const [der, par] = await Promise.all([
+    deribit.fetchOptionChain(coin),
+    paradexOptions.fetchOptionChain(coin),
+  ]);
+  if (!der.length || !par.length) return [];
+
+  const key = (q: { expiry: number; strike: number; type: string }) =>
+    `${q.expiry}:${q.strike}:${q.type}`;
+
+  const parMap = new Map(par.filter((q) => q.markIv > 0).map((q) => [key(q), q]));
+  const now = Date.now();
+  const out: CrossVenueIv[] = [];
+
+  for (const d of der) {
+    if (d.markIv <= 0 || d.expiry <= now) continue;
+    const p = parMap.get(key(d));
+    if (!p) continue;
+
+    const T = (d.expiry - now) / YEAR_MS;
+    const g = blackScholes(d.underlyingPrice, d.strike, T, d.markIv, d.type);
+
+    // Deep wings carry huge apparent IV gaps because both venues are quoting a
+    // model there, not a tradable market. Restrict to strikes with real delta.
+    const absDelta = Math.abs(g.delta);
+    if (absDelta < 0.10 || absDelta > 0.90) continue;
+
+    out.push({
+      coin,
+      expiry: d.expiry,
+      strike: d.strike,
+      type: d.type,
+      deribitIv: d.markIv,
+      paradexIv: p.markIv,
+      ivSpreadVolPts: (d.markIv - p.markIv) * 100,
+      vegaPerContract: g.vega,
+    });
+  }
+
+  return out.sort((a, b) => Math.abs(b.ivSpreadVolPts) - Math.abs(a.ivSpreadVolPts));
+}
+
+function printCrossVenue(coin: string, rows: CrossVenueIv[]) {
+  console.log(`\n${C.bold}${coin} — Options vs Options (Deribit vs Paradex, same strike & expiry)${C.reset}`);
+  if (!rows.length) {
+    console.log(`  ${C.dim}no strikes quoted on both venues${C.reset}`);
+    return;
+  }
+
+  const matched = rows.length;
+  const mean = rows.reduce((s, r) => s + r.ivSpreadVolPts, 0) / matched;
+  console.log(`  ${C.dim}${matched} contracts quoted on both · mean Deribit − Paradex IV = ${mean.toFixed(2)} vol pts${C.reset}`);
+  console.log(
+    `  ${"Expiry".padEnd(12)}${"Strike".padStart(10)}${"Type".padStart(6)}` +
+    `${"Deribit IV".padStart(12)}${"Paradex IV".padStart(12)}${"Spread".padStart(11)}   Trade`
+  );
+
+  for (const r of rows.slice(0, 10)) {
+    const sellDeribit = r.ivSpreadVolPts > 0;
+    console.log(
+      `  ${new Date(r.expiry).toISOString().slice(0, 10).padEnd(12)}` +
+      `${r.strike.toLocaleString("en-US").padStart(10)}${r.type.padStart(6)}` +
+      `${((r.deribitIv * 100).toFixed(1) + "%").padStart(12)}` +
+      `${((r.paradexIv * 100).toFixed(1) + "%").padStart(12)}` +
+      `${(r.ivSpreadVolPts.toFixed(2) + "v").padStart(11)}   ` +
+      `${C.dim}${sellDeribit ? "sell Deribit / buy Paradex" : "sell Paradex / buy Deribit"}${C.reset}`
+    );
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
@@ -129,6 +223,9 @@ async function main() {
 
     printArbs(coin, "Deribit", der, args.minApr);
     printArbs(coin, "Paradex", par, args.minApr);
+
+    const cross = await scanCrossVenueIv(coin).catch(() => [] as CrossVenueIv[]);
+    printCrossVenue(coin, cross);
 
     // Cross-venue: the same structure priced differently on the two books
     if (der.length && par.length) {

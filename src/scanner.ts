@@ -10,7 +10,7 @@
 
 import { perpExchanges, spotExchanges } from "./exchanges";
 import { EXCHANGE_FEES } from "./backtest";
-import type { PerpExchange, SpotExchange } from "./exchanges/types";
+import type { PerpExchange, SpotExchange, FundingRateEntry } from "./exchanges/types";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -96,6 +96,26 @@ async function fetchLatestRate(
     ]);
 
     if (rates.length === 0) {
+      // Some venues publish a current rate but no history (Lighter's history
+      // endpoint 403s). The scanner only needs "right now", so fall back to the
+      // point-in-time reading where the adapter exposes one. This is a real
+      // observation about the present, not reconstructed history.
+      const withCurrent = exchange as PerpExchange & {
+        fetchCurrentFundingRate?: (c: string) => Promise<FundingRateEntry | null>;
+      };
+      if (typeof withCurrent.fetchCurrentFundingRate === "function") {
+        const current = await withCurrent.fetchCurrentFundingRate(coin).catch(() => null);
+        if (current) {
+          return {
+            exchange: exchange.info.id,
+            name: exchange.info.name,
+            rate: current.fundingRate,
+            timestamp: current.timestamp,
+            available: true,
+          };
+        }
+      }
+
       return {
         exchange: exchange.info.id,
         name: exchange.info.name,

@@ -18,7 +18,9 @@
     "ui": "cd ui && npm run dev",
     "dev": "concurrently \"bun run api\" \"bun run ui\"",
     "compare": "bun run src/compare-strategies.ts",
-    "options-arb": "bun run src/options-arb.ts"
+    "options-arb": "bun run src/options-arb.ts",
+    "fit-smile": "bun run src/fit-smile.ts",
+    "verify-data": "bun run src/verify-data.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

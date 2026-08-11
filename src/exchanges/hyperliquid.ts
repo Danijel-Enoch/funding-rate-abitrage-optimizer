@@ -41,6 +41,48 @@ export class HyperliquidExchange implements PerpExchange {
     return all;
   }
 
+  /**
+   * Hourly mark price history from candleSnapshot. Needed so an inter-venue
+   * basis can be measured against this venue's own prices rather than a
+   * substituted series.
+   */
+  async fetchPrices(
+    coin: string,
+    startTime: number,
+    endTime: number
+  ): Promise<Array<{ timestamp: number; price: number }>> {
+    const out = new Map<number, number>();
+    const WINDOW = 30 * 24 * 3600 * 1000;
+
+    for (let from = startTime; from < endTime; from += WINDOW) {
+      const to = Math.min(from + WINDOW, endTime);
+      try {
+        const res = await fetch(HL_API, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "candleSnapshot",
+            req: { coin, interval: "1h", startTime: from, endTime: to },
+          }),
+          signal: AbortSignal.timeout(20000),
+        });
+        if (!res.ok) continue;
+        const data = (await res.json()) as any[];
+        for (const k of data ?? []) {
+          const px = parseFloat(k.c);
+          if (Number.isFinite(px) && px > 0) out.set(k.t, px);
+        }
+      } catch {
+        continue;
+      }
+      await Bun.sleep(100);
+    }
+
+    return [...out.entries()]
+      .map(([timestamp, price]) => ({ timestamp, price }))
+      .sort((a, b) => a.timestamp - b.timestamp);
+  }
+
   async getAvailableCoins(): Promise<string[]> {
     const res = await fetch(HL_API, {
       method: "POST",

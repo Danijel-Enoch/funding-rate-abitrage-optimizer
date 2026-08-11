@@ -132,6 +132,49 @@ Output includes a cross-period APY matrix, the same figures as monthly compounde
 return, an executability check against each venue's minimum order size, and a target
 check showing the leverage a given monthly return would require.
 
+### Data Integrity
+
+Every series the backtests consume is validated before use: it must be observed
+from the venue's API over the requested window, vary, land inside that window, and
+cover at least 90% of it. Nothing is ever substituted when data is missing — the
+affected pair is skipped and the reason printed.
+
+```bash
+bun run verify-data                         # BTC/ETH/SOL over 365d
+bun run verify-data BTC --days 180
+```
+
+Series carry a provenance tag:
+
+| Provenance | Meaning | Backtestable |
+|------------|---------|--------------|
+| `observed` | read directly from the venue API for that window | yes |
+| `derived` | a documented transform of observed data (e.g. hourly resampling) | yes |
+| `synthetic` | extrapolated, assumed, or carried from another window | never |
+
+Known limits this surfaces, rather than papering over:
+
+- **Lighter** publishes no funding history (403). It returns nothing for historical
+  windows; its current rate is still used by the live scanner.
+- **Paradex** funding ignores start/end timestamps, so its perps cannot be
+  backtested. Its options chain is live-scannable and its prices are fine.
+- **Hyperliquid** retains ~208 days of hourly candles, so it is usable over 90 and
+  180 days and rejected over 365. Validation is per-window for this reason.
+- **Deribit** is the only venue with a historical implied-vol series (DVOL), so it
+  is the only venue whose options can be backtested.
+
+### Volatility Smile
+
+The iron fly needs wing volatilities and DVOL only publishes the ATM level. No
+smile is hardcoded — it is fitted from a live Deribit chain and stored with its
+observation date, and every iron fly result is tagged with that date. Without a
+fitted smile the strategy refuses to run.
+
+```bash
+bun run fit-smile                           # fit BTC + ETH, write data/smile.json
+bun run fit-smile --print                   # show residuals, write nothing
+```
+
 ### Options Conversion Arbitrage (Live)
 
 Scans Deribit and Paradex option chains for perp/option basis via put-call parity.
@@ -234,8 +277,9 @@ can only trade options on Paradex. `bun run compare` reports this explicitly.
 - The long wings cap the tail at the cost of part of the premium, so it earns less
   than the naked straddle but with a materially smaller worst-case trade
 - Wing width is swept in standardized moneyness (0.75σ to 2.0σ)
-- Wing vols come from a smile fitted to a live Deribit chain and held constant in
-  shape while its level scales with DVOL — the absolute numbers are smile-dependent
+- Wing vols come from a smile fitted to a live Deribit chain (`bun run fit-smile`)
+  and held constant in shape while its level scales with DVOL. The absolute numbers
+  are smile-dependent and every result carries the smile's observation date
 - A cross-venue variant (`options-arb`) compares matched strikes on Deribit vs
   Paradex; that one is live-only, since neither venue publishes historical chains
 

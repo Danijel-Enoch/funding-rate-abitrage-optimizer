@@ -45,6 +45,42 @@ export class AsterExchange implements PerpExchange {
     return all;
   }
 
+  /** Hourly mark price history from klines, for measuring this venue's own basis. */
+  async fetchPrices(
+    coin: string,
+    startTime: number,
+    endTime: number
+  ): Promise<Array<{ timestamp: number; price: number }>> {
+    const symbol = `${coin}USDT`;
+    const out = new Map<number, number>();
+    let cursor = startTime;
+
+    while (cursor < endTime) {
+      try {
+        const res = await fetch(
+          `${ASTER_API}/fapi/v1/klines?symbol=${symbol}&interval=1h&startTime=${cursor}&endTime=${endTime}&limit=1000`,
+          { signal: AbortSignal.timeout(20000) }
+        );
+        if (!res.ok) break;
+        const data = (await res.json()) as any[][];
+        if (!data?.length) break;
+
+        for (const k of data) {
+          const px = parseFloat(k[4]);
+          if (Number.isFinite(px) && px > 0) out.set(k[0], px);
+        }
+        cursor = data[data.length - 1][0] + 1;
+      } catch {
+        break;
+      }
+      await Bun.sleep(100);
+    }
+
+    return [...out.entries()]
+      .map(([timestamp, price]) => ({ timestamp, price }))
+      .sort((a, b) => a.timestamp - b.timestamp);
+  }
+
   async getAvailableCoins(): Promise<string[]> {
     try {
       const res = await fetch(`${ASTER_API}/fapi/v3/exchangeInfo`);

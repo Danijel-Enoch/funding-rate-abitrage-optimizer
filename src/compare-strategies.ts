@@ -26,12 +26,16 @@ import {
   runBacktest, EXCHANGE_FEES, type BacktestConfig, type BacktestResult,
 } from "./backtest";
 import {
-  runOptionsBacktest, buildHourlyGrid, OPTIONS_FEES, type OptionsBacktestResult,
+  runOptionsBacktest, buildHourlyGrid, OPTIONS_FEES, smileProvenance, getSmile,
+  type OptionsBacktestResult,
 } from "./backtest-options";
 import { resampleFundingHourly, annualizedFunding, alignEntryToPrevailingFunding } from "./funding-normalize";
 import { deribit, hyperliquid, aster, lighterSpot } from "./exchanges/index";
 import type { FundingRateEntry, PerpExchange } from "./exchanges/types";
 import type { DvolEntry } from "./exchanges/deribit";
+import {
+  validateFundingSeries, validatePriceSeries, type SeriesMeta, type ValidationReport, type Window,
+} from "./data-integrity";
 
 const CACHE_DIR = join(import.meta.dir, "..", ".cache");
 
@@ -40,31 +44,42 @@ const CACHE_DIR = join(import.meta.dir, "..", ".cache");
 // API. Anything that fabricates or flat-lines a series is excluded below, since
 // a constant "rate" backtests as a straight line and manufactures a Sharpe in
 // the hundreds.
-const PERP_VENUES: Array<{ id: string; ex: PerpExchange }> = [
-  { id: "deribit", ex: deribit },
-  { id: "hyperliquid", ex: hyperliquid },
-  { id: "aster", ex: aster },
+const PERP_VENUES: Array<{
+  id: string; ex: PerpExchange;
+  funding: Omit<SeriesMeta, "source">;
+  price: Omit<SeriesMeta, "source">;
+}> = [
+  {
+    id: "deribit", ex: deribit,
+    funding: { endpoint: "/public/get_funding_rate_history", field: "interest_1h", provenance: "observed" },
+    price: { endpoint: "/public/get_tradingview_chart_data", field: "close", provenance: "observed" },
+  },
+  {
+    id: "hyperliquid", ex: hyperliquid,
+    funding: { endpoint: "POST /info fundingHistory", field: "fundingRate", provenance: "observed" },
+    price: { endpoint: "POST /info candleSnapshot", field: "c", provenance: "observed" },
+  },
+  {
+    id: "aster", ex: aster,
+    funding: { endpoint: "/fapi/v3/fundingRate", field: "fundingRate", provenance: "observed" },
+    price: { endpoint: "/fapi/v1/klines", field: "close", provenance: "observed" },
+  },
 ];
 
 /** Venues deliberately kept out of historical runs, with the reason shown to the user. */
 const EXCLUDED_FROM_HISTORY: Array<{ id: string; reason: string }> = [
-  { id: "lighter", reason: "funding history API returns 403; adapter replicates the current rate across the window (constant series)" },
-  { id: "paradex", reason: "public funding endpoint ignores start/end timestamps and only walks back hours" },
+  { id: "lighter", reason: "no funding history endpoint (403); adapter now returns nothing rather than replicating the current rate" },
+  { id: "paradex", reason: "funding endpoint ignores start/end timestamps — perps excluded, options still scanned live" },
   { id: "binance / bybit / okx / mexc", reason: "endpoints unreachable from this network (empty responses)" },
 ];
 
-/**
- * Guards against a venue whose adapter fabricates history. A funding series with
- * almost no distinct values cannot be real over a year.
- */
-function isDegenerateSeries(rates: FundingRateEntry[]): boolean {
-  if (rates.length < 24) return true;
-  const distinct = new Set(rates.map((r) => r.fundingRate.toFixed(12)));
-  return distinct.size <= Math.max(2, rates.length / 500);
-}
-
 const SPOT_VENUE = { id: "lighter-spot", ex: lighterSpot };
-const OPTIONS_VENUES = ["deribit", "paradex"];
+/**
+ * Venues whose options can actually be backtested: Deribit alone, because it is
+ * the only one publishing a historical implied-vol series (DVOL). Paradex has a
+ * live chain and is scanned by `bun run options-arb`, but has no vol history.
+ */
+const BACKTESTABLE_OPTIONS_VENUES = ["deribit"];
 
 // ── CLI ──
 interface Args {
@@ -120,8 +135,25 @@ function cached<T>(key: string, useCache: boolean, fetcher: () => Promise<T>): P
 }
 
 // ── Data bundle ──
+/** Raw series as fetched, with its provenance, before any window is applied. */
+interface RawSeries<T> {
+  data: T[];
+  meta: SeriesMeta;
+}
+
+/** Everything fetched for a coin at the longest window, unvalidated. */
+interface CoinFetch {
+  coin: string;
+  funding: Map<string, RawSeries<FundingRateEntry>>;
+  prices: Map<string, RawSeries<{ timestamp: number; price: number }>>;
+  spot: RawSeries<{ timestamp: number; price: number }>;
+  dvol: RawSeries<DvolEntry>;
+}
+
 interface CoinData {
   coin: string;
+  /** Validation outcome for every series pulled, passing or not. */
+  reports: ValidationReport[];
   funding: Map<string, FundingRateEntry[]>;   // hourly-normalized, by venue
   prices: Map<string, Array<{ timestamp: number; price: number }>>;
   spotPrices: Array<{ timestamp: number; price: number }>;
@@ -129,70 +161,108 @@ interface CoinData {
 }
 
 /**
- * Fetches at `maxDays` and slices shorter windows out of the same series, so a
- * 90/180/365 sweep costs one set of API pulls rather than three.
+ * Validates every raw series against a specific window and returns only what
+ * passes. Validation is per-window on purpose: a venue that retains 208 days of
+ * price history is legitimately usable over 90 and 180 days and legitimately
+ * unusable over 365. Validating once at the longest window would throw away
+ * good data for the shorter ones.
  */
-function sliceCoinData(data: CoinData, days: number): CoinData {
-  const cutoff = Date.now() - days * 86400000;
-  const after = <T extends { timestamp: number }>(xs: T[]) => xs.filter((x) => x.timestamp >= cutoff);
+function sliceCoinData(fetched: CoinFetch, days: number): CoinData {
+  const end = Date.now();
+  const start = end - days * 86400000;
+  const window: Window = { start, end };
+  const after = <T extends { timestamp: number }>(xs: T[]) => xs.filter((x) => x.timestamp >= start);
 
+  const reports: ValidationReport[] = [];
   const funding = new Map<string, FundingRateEntry[]>();
-  for (const [v, r] of data.funding) {
-    const sliced = after(r);
-    if (sliced.length > 24) funding.set(v, sliced);
-  }
   const prices = new Map<string, Array<{ timestamp: number; price: number }>>();
-  for (const [v, p] of data.prices) prices.set(v, after(p));
+
+  for (const [venue, raw] of fetched.funding) {
+    const sliced = after(raw.data);
+    const r = validateFundingSeries(`${venue} funding`, sliced, raw.meta, window);
+    reports.push(r);
+    // Hourly resampling is a documented transform of validated observations
+    if (r.ok) funding.set(venue, resampleFundingHourly(sliced));
+  }
+
+  for (const [venue, raw] of fetched.prices) {
+    const sliced = after(raw.data);
+    const r = validatePriceSeries(`${venue} price`, sliced, raw.meta, window);
+    reports.push(r);
+    if (r.ok) prices.set(venue, sliced);
+  }
+
+  const slicedSpot = after(fetched.spot.data);
+  const spotReport = validatePriceSeries("lighter-spot price", slicedSpot, fetched.spot.meta, window);
+  reports.push(spotReport);
+
+  const slicedDvol = after(fetched.dvol.data);
+  let dvol: DvolEntry[] = [];
+  if (slicedDvol.length > 0) {
+    const r = validatePriceSeries(
+      "deribit DVOL", slicedDvol.map((d) => ({ timestamp: d.timestamp, price: d.close })),
+      fetched.dvol.meta, window
+    );
+    reports.push(r);
+    if (r.ok) dvol = slicedDvol;
+  }
 
   return {
-    coin: data.coin,
+    coin: fetched.coin,
+    reports,
     funding,
     prices,
-    spotPrices: after(data.spotPrices),
-    dvol: after(data.dvol),
+    spotPrices: spotReport.ok ? slicedSpot : [],
+    dvol,
   };
 }
 
-async function loadCoinData(coin: string, days: number, useCache: boolean): Promise<CoinData> {
+/** Fetches every series once, at the longest window. No validation here. */
+async function loadCoinData(coin: string, days: number, useCache: boolean): Promise<CoinFetch> {
   const now = Date.now();
   const start = now - days * 86400000;
   const tag = `${coin}-${days}d`;
 
-  const funding = new Map<string, FundingRateEntry[]>();
-  const prices = new Map<string, Array<{ timestamp: number; price: number }>>();
+  const funding = new Map<string, RawSeries<FundingRateEntry>>();
+  const prices = new Map<string, RawSeries<{ timestamp: number; price: number }>>();
 
-  for (const { id, ex } of PERP_VENUES) {
-    const raw = await cached(`funding-${id}-${tag}`, useCache, () =>
-      ex.fetchFundingRates(coin, start, now).catch(() => [])
+  for (const v of PERP_VENUES) {
+    const raw = await cached(`funding-${v.id}-${tag}`, useCache, () =>
+      v.ex.fetchFundingRates(coin, start, now).catch(() => [])
     );
-    if (raw.length > 24 && !isDegenerateSeries(raw)) {
-      // Normalize every venue onto the same hourly grid so an 8h venue can be
-      // compared against an hourly one without dropping points or scaling carry.
-      funding.set(id, resampleFundingHourly(raw));
-    } else if (raw.length > 24) {
-      console.log(`${C.red}  ! ${id}: funding series has no variation — excluded as synthetic${C.reset}`);
-    }
+    funding.set(v.id, { data: raw, meta: { source: v.id, ...v.funding } });
 
-    const anyEx = ex as PerpExchange & {
+    const anyEx = v.ex as PerpExchange & {
       fetchPrices?: (c: string, s: number, e: number) => Promise<Array<{ timestamp: number; price: number }>>;
     };
     if (typeof anyEx.fetchPrices === "function") {
-      const px = await cached(`price-${id}-${tag}`, useCache, () =>
+      const px = await cached(`price-${v.id}-${tag}`, useCache, () =>
         anyEx.fetchPrices!(coin, start, now).catch(() => [])
       );
-      if (px.length > 24) prices.set(id, px);
+      prices.set(v.id, { data: px, meta: { source: v.id, ...v.price } });
     }
   }
 
-  const spotPrices = await cached(`spot-${SPOT_VENUE.id}-${tag}`, useCache, () =>
+  const spot = await cached(`spot-${SPOT_VENUE.id}-${tag}`, useCache, () =>
     SPOT_VENUE.ex.fetchPrices(`${coin}USDT`, start, now).catch(() => [])
   );
-
   const dvol = await cached(`dvol-${tag}`, useCache, () =>
     deribit.fetchDvol(coin, start, now).catch(() => [])
   );
 
-  return { coin, funding, prices, spotPrices, dvol };
+  return {
+    coin,
+    funding,
+    prices,
+    spot: {
+      data: spot,
+      meta: { source: SPOT_VENUE.id, endpoint: "/api/v1/candlesticks", field: "close", provenance: "observed" },
+    },
+    dvol: {
+      data: dvol,
+      meta: { source: "deribit", endpoint: "/public/get_volatility_index_data", field: "close", provenance: "observed" },
+    },
+  };
 }
 
 // ── Strategy runs ──
@@ -313,7 +383,9 @@ function sweep(
   return best ? { best, params } : null;
 }
 
-function runPerpVsPerp(data: CoinData, capital: number, notionalMult: number): StrategyRun[] {
+function runPerpVsPerp(
+  data: CoinData, capital: number, notionalMult: number, skipped: string[] = []
+): StrategyRun[] {
   const runs: StrategyRun[] = [];
   const venues = [...data.funding.keys()];
 
@@ -324,8 +396,16 @@ function runPerpVsPerp(data: CoinData, capital: number, notionalMult: number): S
       const { ratesA, ratesB } = alignEntryToPrevailingFunding(
         data.funding.get(a)!, data.funding.get(b)!
       );
-      const priceA = data.prices.get(a) ?? data.spotPrices;
-      const priceB = data.prices.get(b) ?? data.spotPrices;
+      // No substitution: if a venue publishes no price history we cannot measure
+      // the basis between the two venues. Falling back to a shared spot series
+      // would report an inter-venue price spread of exactly zero — inventing the
+      // absence of the very risk this strategy carries.
+      const priceA = data.prices.get(a);
+      const priceB = data.prices.get(b);
+      if (!priceA?.length || !priceB?.length) {
+        skipped.push(`${a} / ${b}: no observed price history for ${!priceA?.length ? a : b}`);
+        continue;
+      }
 
       const swept = sweep((fundingThreshold, useMakerFees) =>
         runBacktest(ratesA, ratesB, {
@@ -345,14 +425,20 @@ function runPerpVsPerp(data: CoinData, capital: number, notionalMult: number): S
   return runs;
 }
 
-function runSpotVsPerp(data: CoinData, capital: number, notionalMult: number): StrategyRun[] {
+function runSpotVsPerp(
+  data: CoinData, capital: number, notionalMult: number, skipped: string[] = []
+): StrategyRun[] {
   const runs: StrategyRun[] = [];
 
   for (const [venue, rawB] of data.funding) {
     // Spot leg pays no funding
     const rawA = rawB.map((r) => ({ ...r, fundingRate: 0, coin: "spot" }));
     const { ratesA, ratesB } = alignEntryToPrevailingFunding(rawA, rawB);
-    const priceB = data.prices.get(venue) ?? data.spotPrices;
+    const priceB = data.prices.get(venue);
+    if (!priceB?.length || !data.spotPrices.length) {
+      skipped.push(`spot / ${venue}: no observed price history for ${!priceB?.length ? venue : "spot"}`);
+      continue;
+    }
 
     const swept = sweep((fundingThreshold, useMakerFees) =>
       runBacktest(ratesA, ratesB, {
@@ -393,17 +479,18 @@ function runOptionsStrategies(
   const grid = buildHourlyGrid(prices, data.dvol, funding);
   if (grid.length < 48) return runs;
 
-  const paradexNote = "Paradex fee model on Deribit IV/funding (no Paradex vol history)";
-
-  for (const venue of OPTIONS_VENUES) {
+  // Deribit only. Paradex publishes no historical implied vol, so a "Paradex"
+  // backtest could only be Deribit's IV and funding wearing Paradex's fee
+  // schedule. That hybrid previously topped the results table while describing
+  // no market that ever existed.
+  for (const venue of BACKTESTABLE_OPTIONS_VENUES) {
     const straddle = runOptionsBacktest(grid, {
       initialCapital: capital, coin: data.coin, venue,
       structure: "short_straddle", notionalLeverage: notionalMult,
       fees: OPTIONS_FEES[venue],
     });
     if (straddle.totalTrades > 0) {
-      runs.push(optionsToRun(data.coin, "perp_vs_options", `short straddle @ ${venue}`,
-        straddle, venue === "paradex" ? paradexNote : undefined));
+      runs.push(optionsToRun(data.coin, "perp_vs_options", `short straddle @ ${venue}`, straddle));
     }
 
     // Wing width is swept: narrow wings cap more tail but cost more premium
@@ -418,8 +505,8 @@ function runOptionsStrategies(
       if (!bestFly || r.annualizedReturn > bestFly.r.annualizedReturn) bestFly = { r, w };
     }
     if (bestFly) {
-      const note = `${bestFly.w}σ wings` + (venue === "paradex" ? ` · ${paradexNote}` : "");
-      runs.push(optionsToRun(data.coin, "options_vs_options", `iron fly @ ${venue}`, bestFly.r, note));
+      runs.push(optionsToRun(data.coin, "options_vs_options", `iron fly @ ${venue}`, bestFly.r,
+        `${bestFly.w}σ wings · ${smileProvenance(data.coin)}`));
     }
   }
   return runs;
@@ -686,24 +773,17 @@ async function main() {
 
   console.log(`\n${C.bold}Perp vs Perp • Perp vs Spot • Perp vs Options • Options vs Options${C.reset}`);
   console.log(`${C.dim}Windows: ${sortedPeriods.map((d) => d + "d").join(", ")} · $${args.capital.toLocaleString("en-US")} capital · notional = ${args.notional}x capital on every strategy${C.reset}`);
-  console.log(`${C.dim}Perp venues: ${PERP_VENUES.map((v) => v.id).join(", ")} · spot: ${SPOT_VENUE.id} · options: ${OPTIONS_VENUES.join(", ")}${C.reset}`);
+  console.log(`${C.dim}Perp venues: ${PERP_VENUES.map((v) => v.id).join(", ")} · spot: ${SPOT_VENUE.id} · options: ${BACKTESTABLE_OPTIONS_VENUES.join(", ") + " (Paradex: live scan only, no vol history)"}${C.reset}`);
   console.log(`${C.dim}Excluded from historical runs:${C.reset}`);
   for (const e of EXCLUDED_FROM_HISTORY) {
     console.log(`${C.dim}  · ${e.id} — ${e.reason}${C.reset}`);
   }
 
-  // Load once at the longest window, then slice
-  const loaded = new Map<string, CoinData>();
+  // Fetch once at the longest window; each window validates its own slice
+  const loaded = new Map<string, CoinFetch>();
   for (const coin of args.coins) {
-    console.log(`\n${C.yellow}Loading ${coin} (${maxDays}d)...${C.reset}`);
-    const data = await loadCoinData(coin, maxDays, args.useCache);
-    const covered = [...data.funding.entries()]
-      .map(([v, r]) => `${v} ${(annualizedFunding(r) * 100).toFixed(1)}%`)
-      .join(", ");
-    console.log(`${C.dim}  funding APR: ${covered || "none"}${C.reset}`);
-    console.log(`${C.dim}  spot prices: ${data.spotPrices.length} · DVOL: ${data.dvol.length}${data.dvol.length ? "" : " (no options market for this coin)"}${C.reset}`);
-    if (data.funding.size > 0) loaded.set(coin, data);
-    else console.log(`${C.red}  no usable funding data, skipping${C.reset}`);
+    console.log(`\n${C.yellow}Fetching ${coin} (${maxDays}d)...${C.reset}`);
+    loaded.set(coin, await loadCoinData(coin, maxDays, args.useCache));
   }
 
   const results: PeriodResult[] = [];
@@ -717,15 +797,35 @@ async function main() {
 
     for (const [coin, full] of loaded) {
       const data = sliceCoinData(full, days);
-      if (data.funding.size === 0) continue;
-
-      const pvp = runPerpVsPerp(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
-      const svp = runSpotVsPerp(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
-      const opt = runOptionsStrategies(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
 
       console.log(`\n${C.bold}${C.cyan}══ ${coin} · ${days}d ══${C.reset}`);
+      for (const r of data.reports.filter((x) => !x.ok)) {
+        const why = r.issues.filter((i) => i.severity === "fatal").map((i) => i.message).join("; ");
+        console.log(`${C.red}  rejected ${r.label}${C.reset} ${C.dim}— ${why}${C.reset}`);
+      }
+      const covered = [...data.funding.entries()]
+        .map(([v, r]) => `${v} ${(annualizedFunding(r) * 100).toFixed(1)}%`)
+        .join(", ");
+      console.log(`${C.dim}  accepted funding: ${covered || "none"}${C.reset}`);
+      console.log(`${C.dim}  accepted prices: ${[...data.prices.keys()].join(", ") || "none"}${data.spotPrices.length ? ", spot" : ""} · DVOL: ${data.dvol.length || "none"}${C.reset}`);
+
+      if (data.funding.size === 0) {
+        console.log(`${C.red}  no validated funding data — nothing to run${C.reset}`);
+        continue;
+      }
+
+      const skipped: string[] = [];
+      const pvp = runPerpVsPerp(data, args.capital, args.notional, skipped).sort((a, b) => b.apy - a.apy);
+      const svp = runSpotVsPerp(data, args.capital, args.notional, skipped).sort((a, b) => b.apy - a.apy);
+      const opt = runOptionsStrategies(data, args.capital, args.notional).sort((a, b) => b.apy - a.apy);
+
       printRunTable(`Perp vs Perp (funding differential)`, pvp, 3);
       printRunTable(`Perp vs Spot (cash and carry)`, svp, 3);
+      if (skipped.length) {
+        console.log(`\n${C.dim}  skipped for missing observed data:${C.reset}`);
+        for (const sk of [...new Set(skipped)]) console.log(`${C.dim}    · ${sk}${C.reset}`);
+      }
+
       if (opt.length) {
         printRunTable(`Options structures (delta-hedged short vol)`, opt, 4);
       } else {
@@ -771,7 +871,9 @@ async function main() {
   console.log(`  · Options use Deribit DVOL as the ATM implied leg and real hourly funding on the hedge.`);
   console.log(`  · Iron fly wing vols come from a fixed smile fitted to a live Deribit chain; its`);
   console.log(`    absolute numbers are smile-dependent, the short straddle's are not.`);
-  console.log(`  · SOL has no options on Deribit or Paradex, so only the perp strategies run for it.${C.reset}`);
+  console.log(`  · SOL has no options on Deribit or Paradex, so only the perp strategies run for it.`);
+  console.log(`  · Every series is validated before use (bun run verify-data). Nothing is`);
+  console.log(`    substituted when data is missing — the pair is skipped and listed above.${C.reset}`);
 
   if (args.json) {
     const out = join(CACHE_DIR, "compare-results.json");

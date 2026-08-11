@@ -1,0 +1,28 @@
+{
+  "fittedAt": 1786442048185,
+  "model": "sigma(m)/sigma_atm = 1 + skew*m + curvature*m^2, m = ln(K/F)/(sigma_atm*sqrt(T))",
+  "coins": {
+    "BTC": {
+      "skew": -0.08022437525324631,
+      "curvature": 0.049008308191773264,
+      "atmIv": 0.31129999999999997,
+      "rmse": 0.022012665876739886,
+      "points": 42,
+      "expiry": 1787904000000,
+      "tenorDays": 16.920741956018517,
+      "observedAt": 1786442047895,
+      "source": "deribit /public/get_book_summary_by_currency (mark_iv)"
+    },
+    "ETH": {
+      "skew": -0.04196997998104955,
+      "curvature": 0.0543273763988177,
+      "atmIv": 0.43700000000000006,
+      "rmse": 0.033247651875374276,
+      "points": 36,
+      "expiry": 1787904000000,
+      "tenorDays": 16.920738611111112,
+      "observedAt": 1786442048184,
+      "source": "deribit /public/get_book_summary_by_currency (mark_iv)"
+    }
+  }
+}

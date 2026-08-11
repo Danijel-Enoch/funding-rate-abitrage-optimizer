@@ -25,15 +25,19 @@
  *   - r      : hourly log returns of the perp mark.
  *   - funding: hourly perp funding.
  *
- * Assumption to be aware of: DVOL gives the ATM level only, so wing vols come
- * from a fixed smile (see SMILE) fitted to a live Deribit chain and held
- * constant in shape while its level scales with DVOL. That is only material for
- * iron_fly, whose edge *is* the ATM-to-wing spread — treat its absolute numbers
- * as smile-dependent. short_straddle uses ATM vol only and does not rely on it.
+ * Assumption to be aware of: DVOL gives the ATM level only. Wing vols come from
+ * a smile fitted to a live Deribit chain by `bun run fit-smile` and held constant
+ * in shape while its level scales with DVOL. No smile is hardcoded — without a
+ * fitted one, iron_fly refuses to run. That dependency is only material for
+ * iron_fly, whose edge *is* the ATM-to-wing spread, and every iron_fly result
+ * carries the smile's observation date. short_straddle prices at ATM vol alone
+ * and does not depend on it at all.
  */
 
 import type { FundingRateEntry } from "./exchanges/types";
 import type { DvolEntry } from "./exchanges/deribit";
+import { readFileSync } from "fs";
+import { join } from "path";
 import { blackScholes, YEAR_MS } from "./options";
 
 export type OptionStructure = "short_straddle" | "iron_fly";
@@ -45,19 +49,52 @@ export type OptionStructure = "short_straddle" | "iron_fly";
  *     σ(m) / σ_atm = 1 + skew · m + curvature · m²
  *
  * Fitted to live Deribit 30-day chains: both coins show the usual put skew
- * (downside vol rich) with an upside smile. Refit with `bun run smile`.
+ * (downside vol rich) with an upside smile. Refit with `bun run fit-smile`.
  */
 export interface SmileParams {
   skew: number;
   curvature: number;
 }
 
-export const SMILE: Record<string, SmileParams> = {
-  BTC: { skew: -0.086, curvature: 0.045 },
-  ETH: { skew: -0.046, curvature: 0.055 },
-};
+/**
+ * Smiles are loaded from data/smile.json, produced by `bun run fit-smile` from a
+ * live Deribit chain. There are deliberately no hardcoded defaults: if no smile
+ * has been fitted, iron_fly cannot be priced and the caller is told so, rather
+ * than silently pricing wings off invented numbers.
+ */
+export interface LoadedSmile extends SmileParams {
+  observedAt: number;
+  rmse: number;
+  points: number;
+  source: string;
+}
 
-export const DEFAULT_SMILE: SmileParams = { skew: -0.07, curvature: 0.05 };
+let smileCache: Record<string, LoadedSmile> | null = null;
+
+function loadSmiles(): Record<string, LoadedSmile> {
+  if (smileCache) return smileCache;
+  try {
+    const path = join(import.meta.dir, "..", "data", "smile.json");
+    const file = JSON.parse(readFileSync(path, "utf8"));
+    smileCache = file.coins ?? {};
+  } catch {
+    smileCache = {};
+  }
+  return smileCache!;
+}
+
+/** Fitted smile for a coin, or null if none has been observed. */
+export function getSmile(coin: string): LoadedSmile | null {
+  return loadSmiles()[coin] ?? null;
+}
+
+/** Human-readable provenance for a smile, to attach to any result using it. */
+export function smileProvenance(coin: string): string {
+  const s = getSmile(coin);
+  if (!s) return "no fitted smile";
+  const date = new Date(s.observedAt).toISOString().slice(0, 10);
+  return `smile fitted ${date} from ${s.points} live Deribit strikes (rmse ${s.rmse.toFixed(3)})`;
+}
 
 /** Vol multiplier vs ATM at standardized moneyness m. Floored to stay positive. */
 export function smileRatio(m: number, p: SmileParams): number {
@@ -102,7 +139,8 @@ export interface OptionsBacktestConfig {
   deltaBand: number;
   /** Close the position if unrealised loss exceeds this fraction of capital. */
   stopLossPct: number;
-  smile: SmileParams;
+  /** Null when no smile has been fitted; iron_fly then refuses to run. */
+  smile: SmileParams | null;
   fees: OptionsFeeModel;
 }
 
@@ -168,7 +206,7 @@ export function defaultOptionsConfig(partial: Partial<OptionsBacktestConfig> = {
     wingWidth: partial.wingWidth ?? 1.0,
     deltaBand: partial.deltaBand ?? 0.05,
     stopLossPct: partial.stopLossPct ?? 0.5,
-    smile: partial.smile ?? SMILE[coin] ?? DEFAULT_SMILE,
+    smile: partial.smile ?? getSmile(coin),
     fees: partial.fees ?? OPTIONS_FEES[venue] ?? OPTIONS_FEES.deribit,
   };
 }
@@ -245,6 +283,10 @@ export function runOptionsBacktest(
   const cfg = defaultOptionsConfig(config);
   if (rows.length < 48) return emptyResult();
 
+  // The short straddle is priced entirely at ATM vol, so it needs no smile.
+  // iron_fly prices wings and cannot be run without an observed one.
+  if (cfg.structure === "iron_fly" && !cfg.smile) return emptyResult();
+
   const dt = 1 / (365 * 24); // one hour in years
   const trades: OptionsTrade[] = [];
   const pnlHistory: number[] = [];
@@ -260,7 +302,8 @@ export function runOptionsBacktest(
   let open: OpenPosition | null = null;
   const fees = cfg.fees;
 
-  const legIv = (atmIv: number, m: number) => Math.max(atmIv * smileRatio(m, cfg.smile), 0.01);
+  const legIv = (atmIv: number, m: number) =>
+    m === 0 || !cfg.smile ? atmIv : Math.max(atmIv * smileRatio(m, cfg.smile), 0.01);
 
   /** Deribit-style option fee: bps of underlying, capped at a % of premium. */
   const optionLegFee = (underlyingNotional: number, premium: number) =>

@@ -4,3 +4,5 @@ bun.lock
 ui/.next/
 api/node_modules/
 ui/node_modules/
+.cache/
+tmp/

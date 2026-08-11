@@ -13,14 +13,28 @@ export const lighterInfo: ExchangeInfo = {
   url: "https://lighter.xyz",
 };
 
+/**
+ * Lighter's funding *history* endpoint returns 403, so fetchFundingRates below
+ * replicates the single current rate across every hour of the requested window.
+ * The series is therefore constant — it carries no historical information.
+ *
+ * Backtesting against it produces a straight-line P&L: a fabricated Sharpe in
+ * the hundreds and a near-zero drawdown, because the "rate" never moves. Any
+ * caller doing a historical run must exclude this venue; it is only meaningful
+ * for live scanning of the current rate.
+ */
+export const LIGHTER_FUNDING_IS_SYNTHETIC = true;
+
 export class LighterExchange implements PerpExchange {
   info = lighterInfo;
+
+  /** See LIGHTER_FUNDING_IS_SYNTHETIC — this venue has no real funding history. */
+  readonly fundingHistoryIsSynthetic = true;
 
   async fetchFundingRates(coin: string, startTime: number, endTime: number): Promise<FundingRateEntry[]> {
     // Lighter's funding history API is currently blocked (403).
     // Workaround: fetch the current funding rate from /api/v1/funding-rates
-    // and generate synthetic hourly data based on that rate.
-    // This is an approximation — real historical data would be more accurate.
+    // and replicate it across the window. NOT historical data — see the note above.
     const lighterMarket = this.mapCoinToMarket(coin);
     if (!lighterMarket) return [];
 

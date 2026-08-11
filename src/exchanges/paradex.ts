@@ -14,57 +14,117 @@ export const paradexInfo: ExchangeInfo = {
   url: "https://paradex.trade",
 };
 
+/**
+ * Paradex publishes a funding snapshot roughly every 5 seconds, and the public
+ * /funding/data endpoint ignores start_timestamp/end_timestamp entirely: it
+ * always returns the newest records and only walks backwards through the `next`
+ * cursor. A year of history is therefore ~6.3M records (~31,500 sequential
+ * pages), which is not retrievable in practice.
+ *
+ * The walk below is bounded and decimated so it terminates. Callers doing long
+ * lookbacks should check PARADEX_MAX_FUNDING_HISTORY_DAYS and fall back to a
+ * venue with real historical funding (Deribit and Hyperliquid both serve a full
+ * year of hourly funding).
+ */
+export const PARADEX_MAX_FUNDING_HISTORY_DAYS = 2;
+
 export class ParadexExchange implements PerpExchange {
   info = paradexInfo;
 
-  async fetchFundingRates(coin: string, startTime: number, endTime: number): Promise<FundingRateEntry[]> {
+  /** Public funding history is limited — see PARADEX_MAX_FUNDING_HISTORY_DAYS. */
+  readonly maxFundingHistoryDays = PARADEX_MAX_FUNDING_HISTORY_DAYS;
+
+  async fetchFundingRates(
+    coin: string,
+    startTime: number,
+    endTime: number,
+    opts: { sampleIntervalHours?: number; maxPages?: number } = {}
+  ): Promise<FundingRateEntry[]> {
     const market = this.mapCoinToMarket(coin);
     if (!market) return [];
 
-    const all: FundingRateEntry[] = [];
-    let cursor: string | undefined;
+    const sampleMs = (opts.sampleIntervalHours ?? 8) * 3600 * 1000;
+    const maxPages = opts.maxPages ?? 200;
 
     const fetchPage = async (nextCursor?: string) => {
-      let url = `${PARADEX_API}/funding/data?market=${market}&start_timestamp=${startTime}&end_timestamp=${endTime}&page_size=200`;
+      let url = `${PARADEX_API}/funding/data?market=${market}&page_size=200`;
       if (nextCursor) url += `&next=${nextCursor}`;
-
-      const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
       if (!res.ok) return null;
       return res.json() as Promise<any>;
     };
 
-    let data = await fetchPage();
-    if (!data || !data.results) return [];
+    // Keep at most one sample per bucket, walking newest → oldest
+    const byBucket = new Map<number, FundingRateEntry>();
+    let cursor: string | undefined;
+    let oldestSeen = Number.POSITIVE_INFINITY;
 
-    for (const entry of data.results) {
-      all.push({
-        timestamp: entry.created_at,
-        fundingRate: parseFloat(entry.funding_rate || "0"),
-        coin,
-      });
-    }
-
-    cursor = data.next;
-    while (cursor) {
-      await new Promise((r) => setTimeout(r, 100));
+    for (let page = 0; page < maxPages; page++) {
+      let data: any;
       try {
         data = await fetchPage(cursor);
       } catch {
         break;
       }
-      if (!data || !data.results || data.results.length === 0) break;
+      if (!data?.results?.length) break;
 
       for (const entry of data.results) {
-        all.push({
-          timestamp: entry.created_at,
-          fundingRate: parseFloat(entry.funding_rate || "0"),
+        const ts = entry.created_at;
+        if (ts < oldestSeen) oldestSeen = ts;
+        if (ts > endTime || ts < startTime) continue;
+        const bucket = Math.floor(ts / sampleMs) * sampleMs;
+        if (byBucket.has(bucket)) continue;
+        // funding_rate_8h is the settled 8h rate; funding_rate is instantaneous
+        byBucket.set(bucket, {
+          timestamp: bucket,
+          fundingRate: parseFloat(entry.funding_rate_8h || entry.funding_rate || "0"),
           coin,
         });
       }
+
+      if (oldestSeen <= startTime) break;
       cursor = data.next;
+      if (!cursor) break;
+      await new Promise((r) => setTimeout(r, 60));
     }
 
-    return all;
+    return [...byBucket.values()].sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  /** Hourly price history. Unlike /funding/data, klines honours the time range. */
+  async fetchPrices(
+    coin: string,
+    startTime: number,
+    endTime: number
+  ): Promise<Array<{ timestamp: number; price: number }>> {
+    const market = this.mapCoinToMarket(coin);
+    if (!market) return [];
+
+    const out = new Map<number, number>();
+    const WINDOW = 30 * 24 * 3600 * 1000;
+
+    for (let from = startTime; from < endTime; from += WINDOW) {
+      const to = Math.min(from + WINDOW, endTime);
+      try {
+        const res = await fetch(
+          `${PARADEX_API}/markets/klines?symbol=${market}&resolution=60&start_at=${from}&end_at=${to}`,
+          { signal: AbortSignal.timeout(20000) }
+        );
+        if (!res.ok) continue;
+        const data = (await res.json()) as any;
+        for (const k of data.results ?? []) {
+          // [ts, open, high, low, close, volume]
+          out.set(k[0], k[4]);
+        }
+      } catch {
+        continue;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    return [...out.entries()]
+      .map(([timestamp, price]) => ({ timestamp, price }))
+      .sort((a, b) => a.timestamp - b.timestamp);
   }
 
   async getAvailableCoins(): Promise<string[]> {
@@ -102,7 +162,6 @@ export class ParadexExchange implements PerpExchange {
       TSLA: "TSLA-USD-PERP", AMD: "AMD-USD-PERP", NFLX: "NFLX-USD-PERP",
       // Commodities
       XAU: "XAU-USD-PERP", XAG: "XAG-USD-PERP", WTI: "WTI-USD-PERP",
-      XAU: "XAU-USD-PERP",
       // ETFs
       SPY: "SPY-USD-PERP", QQQ: "QQQ-USD-PERP",
     };

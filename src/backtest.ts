@@ -11,7 +11,7 @@
 
 import type { FundingRateEntry } from "./exchanges/types";
 
-export type StrategyType = "spot_vs_perp" | "perp_vs_perp" | "spot_vs_multi_perp";
+export type StrategyType = "spot_vs_perp" | "perp_vs_perp" | "spot_vs_multi_perp" | "perp_vs_options";
 
 // Fee model for each exchange
 export interface FeeModel {
@@ -27,6 +27,7 @@ export const EXCHANGE_FEES: Record<string, FeeModel> = {
   aster:         { takerFeeBps: 4.0, makerFeeBps: 1.0, avgSpreadBps: 5.0 },
   extended:      { takerFeeBps: 2.0, makerFeeBps: 0.0, avgSpreadBps: 4.0 },
   paradex:       { takerFeeBps: 5.0, makerFeeBps: 2.0, avgSpreadBps: 3.0 },
+  deribit:       { takerFeeBps: 5.0, makerFeeBps: 0.0, avgSpreadBps: 1.0 },
   nado:          { takerFeeBps: 4.0, makerFeeBps: 1.0, avgSpreadBps: 4.0 },
   gmx:           { takerFeeBps: 5.0, makerFeeBps: 0.0, avgSpreadBps: 3.0 },
   "binance-perp":{ takerFeeBps: 4.0, makerFeeBps: 2.0, avgSpreadBps: 1.0 },
@@ -1222,9 +1223,17 @@ export function runBacktest(
   }
   const avg = returns.reduce((a, b) => a + b, 0) / (returns.length || 1);
   const std = Math.sqrt(returns.reduce((s, r) => s + (r - avg) ** 2, 0) / (returns.length || 1)) || 1;
-  const sharpeRatio = (avg / std) * Math.sqrt(365 * 24);
+  // Annualize from the actual elapsed span, not the sample count. Funding
+  // cadence differs across venues (Deribit/Hyperliquid hourly, most CEXs 8h), so
+  // assuming one sample per hour would misstate APY and Sharpe when comparing
+  // strategies against each other.
+  const elapsedDays = data.length > 1
+    ? (data[data.length - 1].timestamp - data[0].timestamp) / (1000 * 60 * 60 * 24)
+    : 0;
+  const periodsPerYear = elapsedDays > 0 ? (returns.length * 365) / elapsedDays : 365 * 24;
+  const sharpeRatio = (avg / std) * Math.sqrt(periodsPerYear);
 
-  const totalDays = data.length / 24;
+  const totalDays = elapsedDays > 0 ? elapsedDays : data.length / 24;
   const annualizedReturn = totalDays > 0
     ? Math.pow(1 + totalPnl / cfg.initialCapital, 365 / totalDays) - 1
     : 0;
@@ -1616,9 +1625,17 @@ function runMultiPerpBacktest(
   }
   const avg = returns.reduce((a, b) => a + b, 0) / (returns.length || 1);
   const std = Math.sqrt(returns.reduce((s, r) => s + (r - avg) ** 2, 0) / (returns.length || 1)) || 1;
-  const sharpeRatio = (avg / std) * Math.sqrt(365 * 24);
+  // Annualize from the actual elapsed span, not the sample count. Funding
+  // cadence differs across venues (Deribit/Hyperliquid hourly, most CEXs 8h), so
+  // assuming one sample per hour would misstate APY and Sharpe when comparing
+  // strategies against each other.
+  const elapsedDays = data.length > 1
+    ? (data[data.length - 1].timestamp - data[0].timestamp) / (1000 * 60 * 60 * 24)
+    : 0;
+  const periodsPerYear = elapsedDays > 0 ? (returns.length * 365) / elapsedDays : 365 * 24;
+  const sharpeRatio = (avg / std) * Math.sqrt(periodsPerYear);
 
-  const totalDays = data.length / 24;
+  const totalDays = elapsedDays > 0 ? elapsedDays : data.length / 24;
   const annualizedReturn = totalDays > 0
     ? Math.pow(1 + totalPnl / cfg.initialCapital, 365 / totalDays) - 1
     : 0;

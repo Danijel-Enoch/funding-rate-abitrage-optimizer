@@ -7,6 +7,8 @@ import { LighterExchange } from "./lighter";
 import { AsterExchange } from "./aster";
 import { ExtendedExchange } from "./extended";
 import { ParadexExchange } from "./paradex";
+import { DeribitExchange } from "./deribit";
+import { ParadexOptionsExchange } from "./paradex-options";
 import { NadoExchange } from "./nado";
 import { GmxExchange } from "./gmx";
 import { BinancePerpExchange } from "./binance-perp";
@@ -29,6 +31,7 @@ export const lighter = new LighterExchange();
 export const aster = new AsterExchange();
 export const extended = new ExtendedExchange();
 export const paradex = new ParadexExchange();
+export const deribit = new DeribitExchange();
 export const nado = new NadoExchange();
 export const gmx = new GmxExchange();
 export const binancePerp = new BinancePerpExchange();
@@ -46,9 +49,14 @@ export const hlSpot = new HyperliquidSpotExchange();
 export const lighterSpot = new LighterSpotExchange();
 
 export const perpExchanges: PerpExchange[] = [
-  hyperliquid, lighter, aster, extended, paradex, nado, gmx,
+  hyperliquid, lighter, aster, extended, paradex, deribit, nado, gmx,
   binancePerp, bybit, okx, mexc,
 ];
+
+// Options venues — the only two venues here with a real options order book.
+// Used by the perp_vs_options strategy.
+export const paradexOptions = new ParadexOptionsExchange();
+export const optionsVenues = ["deribit", "paradex"] as const;
 export const bscStocks = new BscStocksExchange();
 export const uniswapStocks = new UniswapStocksExchange();
 export const spotExchanges: SpotExchange[] = [

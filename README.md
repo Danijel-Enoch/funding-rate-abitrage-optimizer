@@ -108,6 +108,31 @@ bun run stocks TSLA --hl-map TSLA:TSLAUSD   # Manual HL ticker override
 
 **Supported stocks:** TSLA, NVDA, AAPL, MSFT, GOOGL, AMZN, META, NFLX, AMD, MU, INTC, AVGO, ARM, TSM, CRWV, ORCL, COIN, MSTR, HOOD, PLTR, SPCX, SPY, QQQ
 
+### Strategy Comparison (Perp vs Perp / Spot / Options)
+
+One-year head-to-head backtest of the three delta-neutral carry structures on BTC and ETH.
+
+```bash
+bun run compare                             # BTC + ETH, 365d, $50k, 1x notional
+bun run compare BTC --days 365
+bun run compare BTC ETH --capital 100000 --notional 2
+bun run compare --no-cache                  # bypass the .cache/ data cache
+bun run compare --json                      # also write .cache/compare-results.json
+```
+
+`--notional` sets position notional as a multiple of capital and is applied to **all three**
+strategies, so returns are comparable. Raw API pulls are cached under `.cache/`.
+
+### Options Conversion Arbitrage (Live)
+
+Scans Deribit and Paradex option chains for perp/option basis via put-call parity.
+
+```bash
+bun run options-arb                         # BTC + ETH, both venues
+bun run options-arb BTC
+bun run options-arb --min-apr 5             # only show >5% net APR
+```
+
 ### Correlation Analysis
 
 Analyzes correlation between funding rate duration patterns and backtest profitability.
@@ -141,7 +166,7 @@ bun run tui                          # Interactive terminal UI
 
 ## Supported Exchanges
 
-### Perp Exchanges (11)
+### Perp Exchanges (12)
 
 | Exchange | Type | Fee (Taker) | Notes |
 |----------|------|-------------|-------|
@@ -149,7 +174,8 @@ bun run tui                          # Interactive terminal UI
 | Lighter | AMM | 2 bps | Stock perps available |
 | Aster | CLOB | 4 bps | |
 | Extended | CLOB | 4 bps | |
-| Paradex | CLOB | 5.5 bps | |
+| Paradex | CLOB | 5.5 bps | Also has an options book; funding history not publicly queryable |
+| Deribit | CLOB | 5 bps | Options book, DVOL index, full 1y hourly funding history |
 | Nado | CLOB | 5 bps | |
 | GMX | AMM | 5 bps | |
 | Binance Perp | CLOB | 4 bps | |
@@ -169,7 +195,25 @@ bun run tui                          # Interactive terminal UI
 | OKX Spot | CLOB | 10 bps | |
 | MEXC Spot | CLOB | 10 bps | |
 
+### Options Venues (2)
+
+Only two venues in this repo have a real options order book. Both are integrated.
+
+| Exchange | Settlement | Option Fee | Historical IV | Notes |
+|----------|-----------|------------|---------------|-------|
+| Deribit | Inverse (coin-margined) | 3 bps of underlying, capped at 12.5% of premium | DVOL index, 1y+ | Deepest crypto options book |
+| Paradex | USDC | 1 bp, capped at 12.5% of premium | none published | Live chain with exchange-computed greeks |
+
 ## Strategies
+
+### Perp vs Options
+- Short an ATM straddle, delta-hedge it with the perp on the same venue
+- Harvests the variance risk premium (implied vol sold above realized vol);
+  the perp hedge leg still pays/earns funding
+- Implied leg uses Deribit DVOL (DVOL² is the fair strike of a 30d variance swap)
+- P&L decomposes into theta/gamma, vega, funding on the hedge, and fees
+- A separate conversion-arb variant (`options-arb`) trades the put-call-parity
+  forward against the perp mark
 
 ### Spot vs Perp
 - Long spot + Short perp (collect funding when perp premium)
